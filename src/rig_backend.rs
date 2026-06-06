@@ -43,10 +43,13 @@ pub struct RigBackend {
 }
 
 impl RigBackend {
-    /// Internal accessor used by the `rig_agent` sibling module to drive
-    /// per-provider `AgentBuilder` construction without leaking the `Inner`
-    /// enum publicly.
-    pub(super) fn inner(&self) -> &Inner {
+    /// Doc-hidden accessor used by greentic-designer's `rig_agent` module
+    /// to drive per-provider `AgentBuilder` construction.
+    ///
+    /// Exposed (doc-hidden) for greentic-designer's `rig_agent`, which builds
+    /// per-provider `AgentBuilder`s on top of this backend. Not a stable API.
+    #[doc(hidden)]
+    pub fn inner(&self) -> &Inner {
         &self.inner
     }
 }
@@ -54,7 +57,11 @@ impl RigBackend {
 /// One variant per supported provider. Each variant holds the rig provider
 /// `Client` (HTTP connection + auth headers); the `Agent<M>` is built fresh
 /// per `chat()` call because `AgentBuilder::tool` consumes `self`.
-pub(super) enum Inner {
+///
+/// Exposed (doc-hidden) for greentic-designer's `rig_agent`, which builds
+/// per-provider `AgentBuilder`s on top of this backend. Not a stable API.
+#[doc(hidden)]
+pub enum Inner {
     Openai(rig::providers::openai::CompletionsClient),
     Anthropic(rig::providers::anthropic::Client),
     Deepseek(rig::providers::deepseek::Client),
