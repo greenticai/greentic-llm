@@ -1,0 +1,33 @@
+[package]
+name = "greentic-llm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+repository = "https://github.com/greenticai/greentic-llm"
+homepage = "https://github.com/greenticai/greentic-llm"
+documentation = "https://docs.rs/greentic-llm"
+readme = "README.md"
+description = "Provider-agnostic multi-LLM abstraction for the Greentic platform (rig-core backend, 9 providers)."
+keywords = ["greentic", "llm", "ai", "rig"]
+categories = ["api-bindings"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4.5", optional = true }
+futures-util = "0.3"
+rig-core = "0.35"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[features]
+default = []
+clap = ["dep:clap"]
+test-mock = []
