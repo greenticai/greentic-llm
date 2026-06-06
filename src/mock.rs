@@ -1,10 +1,12 @@
-//! Test mock implementing the new LlmProvider trait at `super::provider`.
+//! Scriptable test double for the [`crate::provider::LlmProvider`] trait.
 //!
-//! Lives behind `#[cfg(any(test, feature = "test-mock"))]` like the legacy
-//! mock trait in `super::mod`. Phase 2's capability rejection tests
-//! (`tests/llm_capability_rejection.rs`, Task 2.5) extend this with
-//! scripted-response queues; for Phase 1 the surface is intentionally
-//! minimal — capability override + canned text response.
+//! Gated behind `#[cfg(any(test, feature = "test-mock"))]` so it is never
+//! compiled into production binaries. Use the `test-mock` Cargo feature to
+//! expose [`TestLlmProvider`] and [`TestLlmProviderBuilder`] in integration
+//! tests or downstream crates that need a controllable LLM backend.
+//!
+//! The current surface supports capability override and a canned text
+//! response; scripted-response queues can be layered on top as needed.
 
 #![cfg(any(test, feature = "test-mock"))]
 

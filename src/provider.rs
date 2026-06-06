@@ -1,9 +1,9 @@
-//! Provider-agnostic LLM trait and request/response types.
+//! Provider-agnostic LLM trait and wire types for the crate.
 //!
-//! This is the new abstraction used by Phase 2 routes. It coexists with the
-//! legacy `LlmProvider` trait in `super::mod` during the rig migration —
-//! routes will switch to this trait in Phase 2, and the legacy trait is
-//! deleted in Phase 4.
+//! Defines [`LlmProvider`] — the single trait all provider backends implement —
+//! together with the request/response/stream types that flow across it.
+//! [`RigBackend`][crate::rig_backend::RigBackend] is the production
+//! implementation; [`crate::mock::TestLlmProvider`] is the test double.
 //!
 //! Design notes:
 //! - `ChatRequest` intentionally does NOT derive `Serialize`/`Deserialize`;
@@ -64,7 +64,7 @@ pub struct ToolDef {
 /// One-shot chat request.
 ///
 /// Not `Serialize`/`Deserialize` — providers translate into their own wire
-/// formats. See `RigBackend` (Task 1.5) for the canonical translation.
+/// formats. See [`crate::rig_backend::RigBackend`] for the canonical translation.
 #[derive(Clone, Debug)]
 pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
@@ -138,7 +138,7 @@ pub enum LlmError {
     Other(#[from] anyhow::Error),
 }
 
-/// Provider-agnostic LLM contract used by Phase 2 routes.
+/// Provider-agnostic LLM contract.
 ///
 /// Implementors must be `Send + Sync` so the trait is usable behind
 /// `Arc<dyn LlmProvider>` for shared application state.

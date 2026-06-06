@@ -1,11 +1,9 @@
-//! `RigBackend` — dispatches the new [`LlmProvider`] trait to rig 0.35
+//! `RigBackend` — dispatches the [`LlmProvider`] trait to rig 0.35
 //! provider clients.
 //!
-//! Phase 1 scope (Task 1.5): text-only chat via `Agent<M>::prompt`. Tool
-//! calling and vision are gated as `LlmError::UnsupportedCapability` for
-//! Phase 1 and will be enabled in Phase 3 when `rig::Agent` is wired into
-//! `executor.rs`. `chat_stream()` is a deterministic stub returning
-//! `UnsupportedCapability` until Phase 3.
+//! Current scope: text-only chat via `Agent<M>::prompt`. Tool calling and
+//! vision return `LlmError::UnsupportedCapability`; streaming is not yet
+//! implemented and also returns `UnsupportedCapability("streaming")`.
 //!
 //! Architectural note — tools are dynamic
 //! ---------------------------------------
@@ -20,10 +18,9 @@
 //! OpenAI completions API choice
 //! -----------------------------
 //! rig 0.35's default `openai::Client` posts to `/responses` (Responses API).
-//! The legacy designer endpoints (and our wiremock test) speak Chat
-//! Completions, so we explicitly use `openai::CompletionsClient` here. Future
-//! Phase 3 work that needs Responses API features (built-in tools, web
-//! search) can opt in via a new `ProviderKind` variant.
+//! Our wiremock test speaks Chat Completions, so we explicitly use
+//! `openai::CompletionsClient` here. Work that needs Responses API features
+//! (built-in tools, web search) can opt in via a new `ProviderKind` variant.
 
 use async_trait::async_trait;
 use rig::client::CompletionClient;
@@ -233,10 +230,8 @@ impl LlmProvider for RigBackend {
     }
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
-        // Phase 1 scope: text-only chat. Tool calls and vision return a
-        // deterministic UnsupportedCapability so callers see a clear error
-        // during the migration window. Phase 3 wires both surfaces through
-        // rig::Agent in executor.rs.
+        // Text-only chat. Tool calls and vision return UnsupportedCapability
+        // so callers receive a clear error; both surfaces are not yet wired.
         if !req.tools.is_empty() {
             return Err(LlmError::UnsupportedCapability("tool_calling_in_chat"));
         }
@@ -250,10 +245,9 @@ impl LlmProvider for RigBackend {
         // Each provider's `Client::agent(model)` returns an `AgentBuilder<M>`
         // with a different `M` generic, so the dispatch can't be DRY'd into a
         // helper function (the return type would need to be erased). The
-        // macro below expands one identical block per provider — rebuild a
-        // fresh agent per call so per-request `tools` (Phase 3) won't fight
-        // `AgentBuilder::tool` consuming `self`. The HTTP connection in the
-        // underlying `Client` is reused across calls.
+        // macro below expands one identical block per provider — rebuilding a
+        // fresh agent per call because `AgentBuilder::tool` consumes `self`.
+        // The HTTP connection in the underlying `Client` is reused across calls.
         macro_rules! run_provider {
             ($client:expr) => {{
                 let mut builder = $client.agent(&self.model);
@@ -293,23 +287,11 @@ impl LlmProvider for RigBackend {
         })
     }
 
-    async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, LlmError> {
-        if !self.capabilities().streaming {
-            return Err(LlmError::UnsupportedCapability("streaming"));
-        }
-        if !req.tools.is_empty() {
-            return Err(LlmError::UnsupportedCapability("tool_calling_in_stream"));
-        }
-        if req.messages.iter().any(|m| !m.images.is_empty()) {
-            return Err(LlmError::UnsupportedCapability("vision_in_stream"));
-        }
-
-        // Phase 1: streaming is a deterministic stub. Phase 3 will replace
-        // this with `Agent::stream_prompt` driving SSE through the existing
-        // `AgentEvent` pipeline.
-        Err(LlmError::UnsupportedCapability(
-            "streaming_not_implemented_phase_1",
-        ))
+    /// Streaming is not yet implemented by this backend.
+    /// Returns `LlmError::UnsupportedCapability("streaming")` unconditionally.
+    /// The canonical capability string checked by callers is `"streaming"`.
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream, LlmError> {
+        Err(LlmError::UnsupportedCapability("streaming"))
     }
 }
 

@@ -7,6 +7,7 @@
 
 pub mod capabilities;
 pub mod credentials;
+#[cfg(any(test, feature = "test-mock"))]
 pub mod mock;
 pub mod provider;
 pub mod rig_backend;

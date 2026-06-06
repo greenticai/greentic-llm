@@ -6,9 +6,9 @@
 //! vision-aware chat endpoint requires `vision: true`.
 //!
 //! The matrix lives in code rather than configuration because it is a property
-//! of the provider's API surface, not user-configurable. The companion
-//! snapshot test in `tests/llm_capability_matrix.rs` catches regressions when
-//! upstream provider crates (e.g. `rig-core`) change behaviour.
+//! of the provider's API surface, not user-configurable. Adding a new provider
+//! requires a new [`ProviderKind`] variant, an entry in [`ProviderKind::all`],
+//! a string mapping, and a row in the [`From<ProviderKind>`] impl.
 
 use std::str::FromStr;
 
