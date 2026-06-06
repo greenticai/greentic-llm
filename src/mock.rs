@@ -5,8 +5,8 @@
 //! expose [`TestLlmProvider`] and [`TestLlmProviderBuilder`] in integration
 //! tests or downstream crates that need a controllable LLM backend.
 //!
-//! The current surface supports capability override and a canned text
-//! response; scripted-response queues can be layered on top as needed.
+//! The current surface supports capability override, a canned fallback text
+//! response, and a scripted FIFO response queue.
 
 #![cfg(any(test, feature = "test-mock"))]
 
@@ -22,6 +22,7 @@ use super::provider::{
 };
 
 /// Test double for the new `LlmProvider` trait. Builder-style construction.
+#[derive(Debug)]
 pub struct TestLlmProvider {
     capabilities: Capabilities,
     provider_name: &'static str,
@@ -79,6 +80,11 @@ impl TestLlmProviderBuilder {
         self
     }
 
+    /// Enqueue a scripted [`ChatResponse`] to be returned by [`LlmProvider::chat`].
+    ///
+    /// Responses are consumed in FIFO order. Once the queue is exhausted,
+    /// `chat()` falls back to the configured `response_text`.
+    /// Has no effect on [`LlmProvider::chat_stream`].
     pub fn script_response(mut self, response: ChatResponse) -> Self {
         self.inner
             .scripted
@@ -181,6 +187,7 @@ mod tests {
 
         let first = provider.chat(req()).await.unwrap();
         assert_eq!(first.tool_calls[0].name, "emit_answers");
+        assert_eq!(first.finish_reason, FinishReason::ToolCalls);
 
         let second = provider.chat(req()).await.unwrap();
         assert_eq!(second.content, "second");
