@@ -3,13 +3,13 @@
 Provider-agnostic multi-LLM abstraction for the Greentic platform.
 
 Extracted from greentic-designer's post-rig-migration LLM layer. One trait,
-23 providers via [rig-core](https://crates.io/crates/rig-core) (plus
+24 providers via [rig-core](https://crates.io/crates/rig-core) (plus
 [rig-bedrock](https://crates.io/crates/rig-bedrock) behind the `bedrock`
 feature):
 
 | Group | Providers |
 |---|---|
-| Major clouds | `openai`, `anthropic`, `azure`, `bedrock`, `gemini` |
+| Major clouds | `openai`, `anthropic`, `azure`, `azure-foundry`, `bedrock`, `gemini` |
 | Hosted APIs | `deepseek`, `cohere`, `groq`, `perplexity`, `xai`, `mistral`, `moonshot`, `minimax`, `zai`, `xiaomimimo` |
 | Aggregators / routers | `openrouter`, `huggingface`, `together`, `hyperbolic`, `galadriel`, `mira` |
 | Local daemons (keyless) | `ollama`, `llamafile` |
@@ -20,6 +20,12 @@ Provider-specific notes:
   `https://{resource}.openai.azure.com`); the key is sent as the `api-key`
   header. Optional `api_version` overrides the GA default. The model name is
   the deployment id.
+- **azure-foundry** — Azure AI Foundry serverless models (DeepSeek, Llama,
+  Phi, Grok, …) via Foundry's OpenAI-compatible v1 surface. `base_url` is
+  required (`https://{resource}.services.ai.azure.com`, normalised to
+  `…/openai/v1`); the key is sent as a bearer token and the model name is the
+  catalog model id (no deployment coupling, no `api_version`). OpenAI models
+  deployed through Foundry are also reachable via `azure`.
 - **bedrock** — compile with the `bedrock` cargo feature. Authenticates via
   the standard AWS credential chain (env vars, `~/.aws`, instance roles);
   `api_key` is ignored and an optional `aws_profile` selects a named profile.

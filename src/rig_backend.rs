@@ -35,6 +35,12 @@
 //! ------------------------------
 //! - Azure requires `cred.base_url` (the resource endpoint) and accepts an
 //!   optional `cred.api_version`; the key is sent as the `api-key` header.
+//! - Azure AI Foundry (serverless "Models as a Service") rides Foundry's
+//!   OpenAI-compatible v1 surface: `cred.base_url` is the Foundry resource
+//!   endpoint (`https://{resource}.services.ai.azure.com`), normalised to
+//!   `{endpoint}/openai/v1`, with the API key sent as a bearer token. The
+//!   model name travels in the request body, so any catalog model id works;
+//!   `cred.api_version` is ignored (the v1 surface is unversioned).
 //! - Bedrock (feature `bedrock`) authenticates through the AWS credential
 //!   chain — `cred.api_key` is ignored, `cred.aws_profile` selects a named
 //!   profile, and `cred.base_url` is rejected because the AWS SDK derives the
@@ -91,6 +97,7 @@ pub enum Inner {
     Perplexity(rig_core::providers::perplexity::Client),
     Xai(rig_core::providers::xai::Client),
     Azure(rig_core::providers::azure::Client),
+    AzureFoundry(rig_core::providers::openai::CompletionsClient),
     Mistral(rig_core::providers::mistral::Client),
     Openrouter(rig_core::providers::openrouter::Client),
     Huggingface(rig_core::providers::huggingface::Client),
@@ -276,6 +283,25 @@ impl RigBackend {
                     .map_err(|e| LlmError::Transport(format!("azure client: {e}")))?;
                 Inner::Azure(client)
             }
+            ProviderKind::AzureFoundry => {
+                // Foundry's OpenAI-compatible v1 surface accepts the resource
+                // API key as a bearer token and takes the model id in the
+                // request body, so rig's OpenAI completions client does the
+                // wire work; only the base URL is Foundry-specific.
+                let endpoint = cred.base_url.as_deref().ok_or_else(|| {
+                    LlmError::Config(
+                        "azure-foundry requires base_url, e.g. \
+                         https://{resource}.services.ai.azure.com"
+                            .to_string(),
+                    )
+                })?;
+                let client = rig_core::providers::openai::CompletionsClient::builder()
+                    .api_key(&cred.api_key)
+                    .base_url(foundry_openai_base(endpoint))
+                    .build()
+                    .map_err(|e| LlmError::Transport(format!("azure-foundry client: {e}")))?;
+                Inner::AzureFoundry(client)
+            }
             #[cfg(feature = "bedrock")]
             ProviderKind::Bedrock => {
                 // Bedrock authenticates through the AWS credential chain;
@@ -311,6 +337,21 @@ impl RigBackend {
             model: model.to_string(),
             inner,
         })
+    }
+}
+
+/// Normalise a Foundry resource endpoint to its OpenAI-compatible v1 base.
+///
+/// Users may supply the bare resource endpoint
+/// (`https://{resource}.services.ai.azure.com`) or the full v1 path; both
+/// resolve to `{endpoint}/openai/v1` so rig's OpenAI client posts to the
+/// right route.
+fn foundry_openai_base(endpoint: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    if trimmed.ends_with("/openai/v1") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/openai/v1")
     }
 }
 
@@ -593,6 +634,7 @@ impl LlmProvider for RigBackend {
             Inner::Perplexity(client) => complete!(client),
             Inner::Xai(client) => complete!(client),
             Inner::Azure(client) => complete!(client),
+            Inner::AzureFoundry(client) => complete!(client),
             Inner::Mistral(client) => complete!(client),
             Inner::Openrouter(client) => complete!(client),
             Inner::Huggingface(client) => complete!(client),
@@ -1050,6 +1092,9 @@ mod tests {
             if *kind == ProviderKind::Azure {
                 cred.base_url = Some("https://example.openai.azure.com".to_string());
             }
+            if *kind == ProviderKind::AzureFoundry {
+                cred.base_url = Some("https://example.services.ai.azure.com".to_string());
+            }
             let backend = RigBackend::new(*kind, "test-model", &cred)
                 .unwrap_or_else(|e| panic!("{} backend should build: {e}", kind.as_str()));
             assert_eq!(backend.provider_name(), kind.as_str());
@@ -1062,6 +1107,34 @@ mod tests {
         expect_config_err(
             RigBackend::new(ProviderKind::Azure, "gpt-4o", &dummy_cred()),
             "azure without base_url",
+        );
+    }
+
+    #[test]
+    fn azure_foundry_without_endpoint_is_a_config_error() {
+        expect_config_err(
+            RigBackend::new(ProviderKind::AzureFoundry, "deepseek-v3", &dummy_cred()),
+            "azure-foundry without base_url",
+        );
+    }
+
+    #[test]
+    fn foundry_base_url_is_normalised_to_the_openai_v1_surface() {
+        assert_eq!(
+            foundry_openai_base("https://res.services.ai.azure.com"),
+            "https://res.services.ai.azure.com/openai/v1"
+        );
+        assert_eq!(
+            foundry_openai_base("https://res.services.ai.azure.com/"),
+            "https://res.services.ai.azure.com/openai/v1"
+        );
+        assert_eq!(
+            foundry_openai_base("https://res.services.ai.azure.com/openai/v1"),
+            "https://res.services.ai.azure.com/openai/v1"
+        );
+        assert_eq!(
+            foundry_openai_base("https://res.services.ai.azure.com/openai/v1/"),
+            "https://res.services.ai.azure.com/openai/v1"
         );
     }
 
