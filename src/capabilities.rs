@@ -42,6 +42,7 @@ pub enum ProviderKind {
     Perplexity,
     Xai,
     Azure,
+    AzureFoundry,
     Bedrock,
     Mistral,
     Openrouter,
@@ -74,6 +75,7 @@ impl ProviderKind {
             ProviderKind::Perplexity,
             ProviderKind::Xai,
             ProviderKind::Azure,
+            ProviderKind::AzureFoundry,
             ProviderKind::Bedrock,
             ProviderKind::Mistral,
             ProviderKind::Openrouter,
@@ -119,6 +121,7 @@ impl ProviderKind {
             ProviderKind::Perplexity => "perplexity",
             ProviderKind::Xai => "xai",
             ProviderKind::Azure => "azure",
+            ProviderKind::AzureFoundry => "azure-foundry",
             ProviderKind::Bedrock => "bedrock",
             ProviderKind::Mistral => "mistral",
             ProviderKind::Openrouter => "openrouter",
@@ -151,6 +154,7 @@ impl FromStr for ProviderKind {
             "perplexity" => Ok(ProviderKind::Perplexity),
             "xai" => Ok(ProviderKind::Xai),
             "azure" => Ok(ProviderKind::Azure),
+            "azure-foundry" => Ok(ProviderKind::AzureFoundry),
             "bedrock" => Ok(ProviderKind::Bedrock),
             "mistral" => Ok(ProviderKind::Mistral),
             "openrouter" => Ok(ProviderKind::Openrouter),
@@ -259,6 +263,16 @@ impl From<ProviderKind> for Capabilities {
                 tools: true,
                 streaming: true,
                 vision: true,
+                system_prompt: true,
+            },
+            // Azure AI Foundry serverless models speak the OpenAI-compatible
+            // v1 surface; tool calling is broadly available across the
+            // catalog, vision is model-dependent.
+            ProviderKind::AzureFoundry => Capabilities {
+                chat: true,
+                tools: true,
+                streaming: true,
+                vision: false,
                 system_prompt: true,
             },
             // Bedrock's Converse API supports tool use, streaming, and
