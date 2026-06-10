@@ -1,26 +1,35 @@
 //! `RigBackend` — dispatches the [`LlmProvider`] trait to rig-core 0.38
 //! provider clients (plus `rig-bedrock` behind the `bedrock` feature).
 //!
-//! Current scope: text-only chat via `Agent<M>::prompt`. Tool calling and
-//! vision return `LlmError::UnsupportedCapability`; streaming is not yet
-//! implemented and also returns `UnsupportedCapability("streaming")`.
+//! Scope: one-shot chat via rig's low-level completion API, including tool
+//! calling and vision wherever the provider's [`Capabilities`] allow them
+//! (requests that exceed the capability matrix are rejected with
+//! `LlmError::UnsupportedCapability("tools")` / `("vision")`). `chat()`
+//! executes exactly one completion per call — the **caller** drives the tool
+//! loop: dispatch the returned `ChatResponse::tool_calls`, append the
+//! assistant turn via `ChatMessage::assistant_with_tool_calls` plus one
+//! `ChatMessage::tool_result` per call, and invoke `chat()` again. Streaming
+//! is not yet implemented and returns `UnsupportedCapability("streaming")`.
 //!
 //! Architectural note — tools are dynamic
 //! ---------------------------------------
 //! Our `LlmProvider::chat()` accepts `req.tools: Vec<ToolDef>` per call —
 //! tools are runtime-discovered from WASM extensions and may differ between
-//! requests. `rig_core::agent::AgentBuilder::tool(...)` consumes `self`, so we
-//! cannot pre-build an `Agent<M>` and add tools later. `RigBackend` therefore
-//! stores the rig `Client` (provider connection) plus the model name only, and
-//! builds a fresh agent inside `chat()` / `chat_stream()` from the per-request
-//! tools. The underlying HTTP connection in `Client` is reused across calls.
+//! requests, and tool dispatch happens in the caller. That rules out rig's
+//! `Agent` abstraction (tools are baked in at agent build time and rig would
+//! drive the tool loop itself). Instead, `chat()` converts the request once
+//! into rig's provider-agnostic `CompletionRequest` and dispatches it via
+//! `CompletionClient::completion_model()` + `CompletionModel::completion()`.
+//! `RigBackend` stores the rig `Client` (provider connection) plus the model
+//! name; the underlying HTTP connection is reused across calls.
 //!
 //! OpenAI completions API choice
 //! -----------------------------
 //! rig's default `openai::Client` posts to `/responses` (Responses API).
-//! Our wiremock test speaks Chat Completions, so we explicitly use
-//! `openai::CompletionsClient` here. Work that needs Responses API features
-//! (built-in tools, web search) can opt in via a new `ProviderKind` variant.
+//! We explicitly use `openai::CompletionsClient` here so requests go to the
+//! Chat Completions endpoint, which is what OpenAI-compatible gateways and
+//! self-hosted shims speak. Work that needs Responses API features (built-in
+//! tools, web search) can opt in via a new `ProviderKind` variant.
 //!
 //! Provider-specific construction
 //! ------------------------------
@@ -37,7 +46,7 @@
 
 use async_trait::async_trait;
 use rig_core::client::CompletionClient;
-use rig_core::completion::Prompt;
+use rig_core::completion::CompletionModel;
 
 use super::capabilities::{Capabilities, ProviderKind};
 use super::credentials::Credential;
@@ -65,8 +74,8 @@ impl RigBackend {
 }
 
 /// One variant per supported provider. Each variant holds the rig provider
-/// `Client` (HTTP connection + auth headers); the `Agent<M>` is built fresh
-/// per `chat()` call because `AgentBuilder::tool` consumes `self`.
+/// `Client` (HTTP connection + auth headers); a `CompletionModel` handle is
+/// created fresh per `chat()` call (cheap — it borrows the client connection).
 ///
 /// Exposed (doc-hidden) for greentic-designer's `rig_agent`, which builds
 /// per-provider `AgentBuilder`s on top of this backend. Not a stable API.
@@ -311,7 +320,7 @@ impl RigBackend {
 
 /// Concatenate every `System` message in the request into a single preamble
 /// string. Returns `None` if no system message is present (rig's
-/// `AgentBuilder::preamble` is optional).
+/// `CompletionRequest::preamble` is optional).
 fn build_preamble(messages: &[super::provider::ChatMessage]) -> Option<String> {
     let parts: Vec<String> = messages
         .iter()
@@ -325,48 +334,197 @@ fn build_preamble(messages: &[super::provider::ChatMessage]) -> Option<String> {
     }
 }
 
-/// Format the conversation history into a single prompt body suitable for
-/// `Agent::prompt()`.
+/// Default `max_tokens` for Anthropic, which rejects requests without one.
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 4096;
+
+/// Convert a greentic [`ChatRequest`] into rig's provider-agnostic
+/// `CompletionRequest`.
 ///
-/// rig's `Prompt::prompt(prompt)` takes a single prompt string (or
-/// `Message`), so we serialise the non-system turns into one body: every turn
-/// before the final user message becomes a `Role: text` line in the history
-/// header, and the final user message is the tail prompt. This mirrors the
-/// existing legacy chat loop's flat-text format.
-fn build_prompt_body(messages: &[super::provider::ChatMessage]) -> String {
-    let last_user_idx = messages
-        .iter()
-        .rposition(|m| matches!(m.role, MessageRole::User))
-        .unwrap_or(messages.len().saturating_sub(1));
+/// System messages are folded into the preamble; user/assistant/tool turns
+/// become rig chat history. Tool results are encoded as rig `User` messages
+/// carrying `UserContent::ToolResult` keyed by `tool_call_id` (the same id
+/// surfaced by [`map_choice`], so caller-driven tool loops round-trip).
+///
+/// Consumes the request so message payloads (notably base64 image data, which
+/// can be multiple megabytes) move into the rig request instead of being
+/// cloned.
+fn build_completion_request(
+    req: ChatRequest,
+    kind: ProviderKind,
+) -> Result<rig_core::completion::CompletionRequest, LlmError> {
+    use rig_core::message::{
+        AssistantContent, ImageMediaType, Message, MimeType, ToolResultContent, UserContent,
+    };
 
-    let mut history = String::new();
-    for (idx, msg) in messages.iter().enumerate() {
-        if matches!(msg.role, MessageRole::System) {
-            // already lifted into the preamble
-            continue;
+    // Build the preamble while the messages are still borrowable; the loop
+    // below consumes them.
+    let preamble = build_preamble(&req.messages);
+    let mut history: Vec<Message> = Vec::new();
+    for m in req.messages {
+        match m.role {
+            MessageRole::System => {} // folded into the preamble
+            MessageRole::User => {
+                let mut content: Vec<UserContent> = Vec::new();
+                if !m.content.is_empty() {
+                    content.push(UserContent::text(m.content));
+                }
+                for img in m.images {
+                    let media_type = ImageMediaType::from_mime_type(&img.media_type);
+                    content.push(UserContent::image_base64(img.data_base64, media_type, None));
+                }
+                if content.is_empty() {
+                    content.push(UserContent::text(String::new()));
+                }
+                history.push(Message::User {
+                    content: rig_core::OneOrMany::many(content)
+                        .map_err(|_| LlmError::Parse("empty user content".into()))?,
+                });
+            }
+            MessageRole::Assistant => {
+                let mut content: Vec<AssistantContent> = Vec::new();
+                if !m.content.is_empty() {
+                    content.push(AssistantContent::text(m.content));
+                }
+                for tc in m.tool_calls {
+                    content.push(AssistantContent::tool_call(tc.id, tc.name, tc.arguments));
+                }
+                if content.is_empty() {
+                    // Skip empty assistant turns rather than erroring; some
+                    // callers store placeholder assistant rows.
+                    continue;
+                }
+                history.push(Message::Assistant {
+                    id: None,
+                    content: rig_core::OneOrMany::many(content)
+                        .map_err(|_| LlmError::Parse("empty assistant content".into()))?,
+                });
+            }
+            MessageRole::Tool => {
+                // Providers key tool results to the originating call; an
+                // unkeyed result would be silently misattributed, so fail
+                // fast instead of sending an empty id.
+                let id = m
+                    .tool_call_id
+                    .ok_or_else(|| LlmError::Parse("tool message missing tool_call_id".into()))?;
+                history.push(Message::User {
+                    content: rig_core::OneOrMany::one(UserContent::tool_result(
+                        id,
+                        rig_core::OneOrMany::one(ToolResultContent::text(m.content)),
+                    )),
+                });
+            }
         }
-        if idx == last_user_idx {
-            // tail handled separately
-            continue;
-        }
-        let role_label = match msg.role {
-            MessageRole::User => "User",
-            MessageRole::Assistant => "Assistant",
-            MessageRole::Tool => "Tool",
-            MessageRole::System => unreachable!("system messages filtered above"),
-        };
-        history.push_str(&format!("{role_label}: {}\n", msg.content));
     }
+    let chat_history = rig_core::OneOrMany::many(history)
+        .map_err(|_| LlmError::Parse("request contained no user/assistant/tool messages".into()))?;
 
-    let tail = messages
-        .get(last_user_idx)
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
+    // Anthropic's API requires max_tokens; default it when the caller did not
+    // set one so requests do not fail provider-side.
+    let max_tokens = req
+        .max_tokens
+        .map(u64::from)
+        .or_else(|| (kind == ProviderKind::Anthropic).then_some(ANTHROPIC_DEFAULT_MAX_TOKENS));
 
-    if history.is_empty() {
-        tail
+    Ok(rig_core::completion::CompletionRequest {
+        model: None,
+        preamble,
+        chat_history,
+        documents: vec![],
+        tools: req
+            .tools
+            .into_iter()
+            .map(|t| rig_core::completion::ToolDefinition {
+                name: t.name,
+                description: t.description,
+                parameters: t.schema,
+            })
+            .collect(),
+        temperature: req.temperature.map(f64::from),
+        max_tokens,
+        tool_choice: map_tool_choice(req.tool_choice.as_deref()),
+        additional_params: None,
+        output_schema: None,
+    })
+}
+
+/// Map the greentic `tool_choice` string convention (`"auto"` / `"none"` /
+/// `"required"` / a specific tool name) onto rig's `ToolChoice`.
+fn map_tool_choice(choice: Option<&str>) -> Option<rig_core::message::ToolChoice> {
+    match choice {
+        None => None,
+        Some("auto") => Some(rig_core::message::ToolChoice::Auto),
+        Some("none") => Some(rig_core::message::ToolChoice::None),
+        Some("required") => Some(rig_core::message::ToolChoice::Required),
+        Some(name) => Some(rig_core::message::ToolChoice::Specific {
+            function_names: vec![name.to_string()],
+        }),
+    }
+}
+
+/// Map rig's response choice back onto greentic's [`ChatResponse`].
+///
+/// Text parts are concatenated (newline-joined); tool calls surface the
+/// provider correlation id (`call_id` when present, else `id`) so the caller
+/// can echo it back via [`super::provider::ChatMessage::tool_result`].
+/// Reasoning and image parts are not surfaced through `ChatResponse`.
+fn map_choice(choice: rig_core::OneOrMany<rig_core::message::AssistantContent>) -> ChatResponse {
+    use rig_core::message::AssistantContent;
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    for part in choice {
+        match part {
+            AssistantContent::Text(t) => {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&t.text);
+            }
+            AssistantContent::ToolCall(tc) => tool_calls.push(super::provider::ToolCall {
+                id: tc.call_id.unwrap_or(tc.id),
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+            }),
+            // Reasoning / Image parts are not surfaced through ChatResponse.
+            AssistantContent::Reasoning(_) | AssistantContent::Image(_) => {}
+        }
+    }
+    let finish_reason = if tool_calls.is_empty() {
+        FinishReason::Stop
     } else {
-        format!("{history}\n{tail}")
+        FinishReason::ToolCalls
+    };
+    ChatResponse {
+        content,
+        tool_calls,
+        finish_reason,
+    }
+}
+
+/// Map rig's `CompletionError` onto [`LlmError`], preserving HTTP status
+/// codes where rig surfaces them.
+fn map_completion_error(e: rig_core::completion::CompletionError) -> LlmError {
+    use rig_core::completion::CompletionError;
+    use rig_core::http_client;
+    match e {
+        CompletionError::HttpError(http_client::Error::InvalidStatusCode(status)) => {
+            LlmError::Status {
+                status: status.as_u16(),
+                body: String::new(),
+            }
+        }
+        CompletionError::HttpError(http_client::Error::InvalidStatusCodeWithMessage(
+            status,
+            body,
+        )) => LlmError::Status {
+            status: status.as_u16(),
+            body,
+        },
+        CompletionError::HttpError(e) => LlmError::Transport(e.to_string()),
+        CompletionError::JsonError(e) => LlmError::Parse(e.to_string()),
+        CompletionError::UrlError(e) => LlmError::Config(e.to_string()),
+        CompletionError::RequestError(e) => LlmError::Transport(e.to_string()),
+        CompletionError::ResponseError(s) => LlmError::Parse(s),
+        CompletionError::ProviderError(s) => LlmError::Transport(s),
     }
 }
 
@@ -388,77 +546,68 @@ impl LlmProvider for RigBackend {
         &self.model
     }
 
+    /// Execute a single completion (text, tool calling, vision) against the
+    /// configured provider. Requests carrying tools or images are rejected
+    /// up front with `UnsupportedCapability("tools")` / `("vision")` when the
+    /// provider's capability matrix does not advertise the feature.
+    ///
+    /// One call = one completion: when the response carries
+    /// [`FinishReason::ToolCalls`], the caller dispatches the tools and
+    /// replays the conversation (see the module docs for the loop pattern).
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
-        // Text-only chat. Tool calls and vision return UnsupportedCapability
-        // so callers receive a clear error; both surfaces are not yet wired.
-        if !req.tools.is_empty() {
-            return Err(LlmError::UnsupportedCapability("tool_calling_in_chat"));
+        let caps = self.capabilities();
+        if !req.tools.is_empty() && !caps.tools {
+            return Err(LlmError::UnsupportedCapability("tools"));
         }
-        if req.messages.iter().any(|m| !m.images.is_empty()) {
-            return Err(LlmError::UnsupportedCapability("vision_in_chat"));
+        if req.messages.iter().any(|m| !m.images.is_empty()) && !caps.vision {
+            return Err(LlmError::UnsupportedCapability("vision"));
         }
 
-        let preamble = build_preamble(&req.messages);
-        let prompt_body = build_prompt_body(&req.messages);
+        let request = build_completion_request(req, self.kind)?;
 
-        // Each provider's `Client::agent(model)` returns an `AgentBuilder<M>`
-        // with a different `M` generic, so the dispatch can't be DRY'd into a
+        // Each provider's `completion_model(model)` returns a different
+        // `CompletionModel` type, so the dispatch can't be DRY'd into a
         // helper function (the return type would need to be erased). The
-        // macro below expands one identical block per provider — rebuilding a
-        // fresh agent per call because `AgentBuilder::tool` consumes `self`.
-        // The HTTP connection in the underlying `Client` is reused across calls.
-        macro_rules! run_provider {
+        // macro expands one identical block per provider. NO wildcard arm:
+        // a new `Inner` variant must fail to compile here rather than
+        // silently miss tool support.
+        macro_rules! complete {
             ($client:expr) => {{
-                let mut builder = $client.agent(&self.model);
-                if let Some(preamble_text) = preamble.as_deref() {
-                    builder = builder.preamble(preamble_text);
-                }
-                if let Some(temp) = req.temperature {
-                    builder = builder.temperature(temp as f64);
-                }
-                if let Some(max) = req.max_tokens {
-                    builder = builder.max_tokens(max as u64);
-                }
-                builder
-                    .build()
-                    .prompt(prompt_body.as_str())
+                let model = $client.completion_model(self.model.as_str());
+                let response = model
+                    .completion(request)
                     .await
-                    .map_err(|e| LlmError::Transport(e.to_string()))?
+                    .map_err(map_completion_error)?;
+                Ok(map_choice(response.choice))
             }};
         }
 
-        let text = match &self.inner {
-            Inner::Openai(client) => run_provider!(client),
-            Inner::Anthropic(client) => run_provider!(client),
-            Inner::Deepseek(client) => run_provider!(client),
-            Inner::Gemini(client) => run_provider!(client),
-            Inner::Cohere(client) => run_provider!(client),
-            Inner::Ollama(client) => run_provider!(client),
-            Inner::Groq(client) => run_provider!(client),
-            Inner::Perplexity(client) => run_provider!(client),
-            Inner::Xai(client) => run_provider!(client),
-            Inner::Azure(client) => run_provider!(client),
-            Inner::Mistral(client) => run_provider!(client),
-            Inner::Openrouter(client) => run_provider!(client),
-            Inner::Huggingface(client) => run_provider!(client),
-            Inner::Together(client) => run_provider!(client),
-            Inner::Moonshot(client) => run_provider!(client),
-            Inner::Minimax(client) => run_provider!(client),
-            Inner::Hyperbolic(client) => run_provider!(client),
-            Inner::Galadriel(client) => run_provider!(client),
-            Inner::Mira(client) => run_provider!(client),
-            Inner::Zai(client) => run_provider!(client),
-            Inner::Xiaomimimo(client) => run_provider!(client),
-            Inner::Llamafile(client) => run_provider!(client),
+        match &self.inner {
+            Inner::Openai(client) => complete!(client),
+            Inner::Anthropic(client) => complete!(client),
+            Inner::Deepseek(client) => complete!(client),
+            Inner::Gemini(client) => complete!(client),
+            Inner::Cohere(client) => complete!(client),
+            Inner::Ollama(client) => complete!(client),
+            Inner::Groq(client) => complete!(client),
+            Inner::Perplexity(client) => complete!(client),
+            Inner::Xai(client) => complete!(client),
+            Inner::Azure(client) => complete!(client),
+            Inner::Mistral(client) => complete!(client),
+            Inner::Openrouter(client) => complete!(client),
+            Inner::Huggingface(client) => complete!(client),
+            Inner::Together(client) => complete!(client),
+            Inner::Moonshot(client) => complete!(client),
+            Inner::Minimax(client) => complete!(client),
+            Inner::Hyperbolic(client) => complete!(client),
+            Inner::Galadriel(client) => complete!(client),
+            Inner::Mira(client) => complete!(client),
+            Inner::Zai(client) => complete!(client),
+            Inner::Xiaomimimo(client) => complete!(client),
+            Inner::Llamafile(client) => complete!(client),
             #[cfg(feature = "bedrock")]
-            Inner::Bedrock(client) => run_provider!(client),
-        };
-
-        Ok(ChatResponse {
-            content: text,
-            tool_calls: vec![],
-            finish_reason: FinishReason::Stop,
-        })
+            Inner::Bedrock(client) => complete!(client),
+        }
     }
 
     /// Streaming is not yet implemented by this backend.
@@ -472,21 +621,339 @@ impl LlmProvider for RigBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ChatMessage;
+    use crate::provider::{ChatImage, ChatMessage, ToolCall, ToolDef};
 
-    fn user_msg(text: &str) -> ChatMessage {
-        ChatMessage {
-            role: MessageRole::User,
-            content: text.into(),
-            images: vec![],
+    fn tool_request() -> ChatRequest {
+        ChatRequest {
+            messages: vec![
+                ChatMessage::system("you are helpful"),
+                ChatMessage::user("hi"),
+                ChatMessage::assistant_with_tool_calls(
+                    "",
+                    vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "lookup".into(),
+                        arguments: serde_json::json!({"q": "x"}),
+                    }],
+                ),
+                ChatMessage::tool_result("call_1", "{\"answer\":42}"),
+            ],
+            tools: vec![ToolDef {
+                name: "lookup".into(),
+                description: "d".into(),
+                schema: serde_json::json!({"type": "object"}),
+            }],
+            tool_choice: Some("auto".into()),
+            max_tokens: None,
+            temperature: Some(0.2),
         }
     }
 
-    fn system_msg(text: &str) -> ChatMessage {
-        ChatMessage {
-            role: MessageRole::System,
-            content: text.into(),
+    #[test]
+    fn builds_completion_request_with_tools_and_history() {
+        let r = build_completion_request(tool_request(), ProviderKind::Anthropic).expect("convert");
+        assert_eq!(r.preamble.as_deref(), Some("you are helpful"));
+        assert_eq!(r.tools.len(), 1);
+        assert_eq!(r.tools[0].name, "lookup");
+        assert_eq!(r.max_tokens, Some(4096)); // anthropic default
+        assert_eq!(r.temperature, Some(0.2f32 as f64));
+        assert_eq!(r.chat_history.len(), 3); // user, assistant(tool_call), tool-result
+        assert!(matches!(
+            r.tool_choice,
+            Some(rig_core::message::ToolChoice::Auto)
+        ));
+    }
+
+    #[test]
+    fn non_anthropic_max_tokens_stays_unset() {
+        let r = build_completion_request(tool_request(), ProviderKind::Openai).expect("convert");
+        assert_eq!(r.max_tokens, None);
+    }
+
+    #[test]
+    fn tool_call_history_round_trips_through_rig_messages() {
+        // rig response with a Completions-API style call (call_id = None,
+        // id = "call_9") must surface id "call_9"; replaying that id must
+        // land on both the assistant tool_call and the tool_result.
+        let r = build_completion_request(tool_request(), ProviderKind::Openai).expect("convert");
+        let history: Vec<_> = r.chat_history.into_iter().collect();
+        match &history[1] {
+            rig_core::message::Message::Assistant { content, .. } => match content.first() {
+                rig_core::message::AssistantContent::ToolCall(tc) => {
+                    assert_eq!(tc.id, "call_1");
+                    assert_eq!(tc.function.name, "lookup");
+                }
+                other => panic!("expected tool call, got {other:?}"),
+            },
+            other => panic!("expected assistant message, got {other:?}"),
+        }
+        match &history[2] {
+            rig_core::message::Message::User { content } => match content.first() {
+                rig_core::message::UserContent::ToolResult(tr) => {
+                    assert_eq!(tr.id, "call_1");
+                }
+                other => panic!("expected tool result, got {other:?}"),
+            },
+            other => panic!("expected user(tool result) message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_choice_with_tool_calls() {
+        let choice = rig_core::OneOrMany::many(vec![
+            rig_core::message::AssistantContent::text("thinking"),
+            rig_core::message::AssistantContent::tool_call(
+                "call_9",
+                "lookup",
+                serde_json::json!({"q": "y"}),
+            ),
+        ])
+        .expect("non-empty");
+        let resp = map_choice(choice);
+        assert_eq!(resp.content, "thinking");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "call_9");
+        assert_eq!(resp.tool_calls[0].name, "lookup");
+        assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[test]
+    fn maps_choice_prefers_call_id_when_present() {
+        let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::ToolCall(
+            rig_core::message::ToolCall::new(
+                "fc_123".into(),
+                rig_core::message::ToolFunction {
+                    name: "lookup".into(),
+                    arguments: serde_json::json!({}),
+                },
+            )
+            .with_call_id("call_abc".into()),
+        ));
+        let resp = map_choice(choice);
+        assert_eq!(resp.tool_calls[0].id, "call_abc");
+    }
+
+    #[test]
+    fn maps_text_only_choice_to_stop() {
+        let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::text("hello"));
+        let resp = map_choice(choice);
+        assert_eq!(resp.content, "hello");
+        assert!(resp.tool_calls.is_empty());
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn user_message_with_image_becomes_image_content() {
+        let mut msg = ChatMessage::user("look at this");
+        msg.images.push(ChatImage {
+            data_base64: "aGVsbG8=".into(),
+            media_type: "image/png".into(),
+        });
+        let req = ChatRequest {
+            messages: vec![msg],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let r = build_completion_request(req, ProviderKind::Openai).expect("convert");
+        let history: Vec<_> = r.chat_history.into_iter().collect();
+        match &history[0] {
+            rig_core::message::Message::User { content } => {
+                let parts: Vec<_> = content.iter().collect();
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(parts[0], rig_core::message::UserContent::Text(_)));
+                match parts[1] {
+                    rig_core::message::UserContent::Image(img) => {
+                        assert_eq!(img.media_type, Some(rig_core::message::ImageMediaType::PNG));
+                    }
+                    other => panic!("expected image content, got {other:?}"),
+                }
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_image_mime_type_passes_through_as_none() {
+        let mut msg = ChatMessage::user("look at this");
+        msg.images.push(ChatImage {
+            data_base64: "aGVsbG8=".into(),
+            media_type: "image/x-unknown".into(),
+        });
+        let req = ChatRequest {
+            messages: vec![msg],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let r = build_completion_request(req, ProviderKind::Openai).expect("convert");
+        let history: Vec<_> = r.chat_history.into_iter().collect();
+        match &history[0] {
+            rig_core::message::Message::User { content } => {
+                let parts: Vec<_> = content.iter().collect();
+                match parts[1] {
+                    rig_core::message::UserContent::Image(img) => {
+                        assert_eq!(img.media_type, None);
+                    }
+                    other => panic!("expected image content, got {other:?}"),
+                }
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_image_user_message_keeps_text_then_images_in_order() {
+        let mut msg = ChatMessage::user("two pictures");
+        msg.images.push(ChatImage {
+            data_base64: "Zmlyc3Q=".into(),
+            media_type: "image/png".into(),
+        });
+        msg.images.push(ChatImage {
+            data_base64: "c2Vjb25k".into(),
+            media_type: "image/jpeg".into(),
+        });
+        let req = ChatRequest {
+            messages: vec![msg],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let r = build_completion_request(req, ProviderKind::Openai).expect("convert");
+        let history: Vec<_> = r.chat_history.into_iter().collect();
+        match &history[0] {
+            rig_core::message::Message::User { content } => {
+                let parts: Vec<_> = content.iter().collect();
+                assert_eq!(parts.len(), 3);
+                match parts[0] {
+                    rig_core::message::UserContent::Text(t) => {
+                        assert_eq!(t.text, "two pictures");
+                    }
+                    other => panic!("expected text content, got {other:?}"),
+                }
+                let expected = [
+                    ("Zmlyc3Q=", rig_core::message::ImageMediaType::PNG),
+                    ("c2Vjb25k", rig_core::message::ImageMediaType::JPEG),
+                ];
+                for (part, (data, media_type)) in parts[1..].iter().zip(expected) {
+                    match part {
+                        rig_core::message::UserContent::Image(img) => {
+                            assert_eq!(img.media_type, Some(media_type));
+                            match &img.data {
+                                rig_core::message::DocumentSourceKind::Base64(b64) => {
+                                    assert_eq!(b64, data);
+                                }
+                                other => panic!("expected base64 image data, got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected image content, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_message_without_tool_call_id_is_a_parse_error() {
+        let unkeyed_tool_msg = ChatMessage {
+            role: MessageRole::Tool,
+            content: "{\"answer\":42}".into(),
             images: vec![],
+            tool_calls: vec![],
+            tool_call_id: None,
+        };
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("hi"), unkeyed_tool_msg],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let err = build_completion_request(req, ProviderKind::Openai)
+            .expect_err("unkeyed tool result must be rejected");
+        match err {
+            LlmError::Parse(msg) => assert!(msg.contains("tool_call_id"), "message: {msg}"),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_system_messages_is_an_error_not_panic() {
+        let req = ChatRequest {
+            messages: vec![ChatMessage::system("only system")],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let err = build_completion_request(req, ProviderKind::Openai)
+            .expect_err("no chat turns must be an error");
+        assert!(matches!(err, LlmError::Parse(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_tools_when_capability_says_no() {
+        // Ollama advertises tools = false.
+        let b = RigBackend::new(ProviderKind::Ollama, "llama3.2", &dummy_cred()).expect("build");
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("hi")],
+            tools: vec![ToolDef {
+                name: "t".into(),
+                description: "d".into(),
+                schema: serde_json::json!({}),
+            }],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let err = b.chat(req).await.expect_err("must reject");
+        assert!(matches!(err, LlmError::UnsupportedCapability("tools")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_images_when_capability_says_no() {
+        // Cohere advertises vision = false.
+        let b = RigBackend::new(ProviderKind::Cohere, "command-r", &dummy_cred()).expect("build");
+        let mut msg = ChatMessage::user("what is this");
+        msg.images.push(ChatImage {
+            data_base64: "aGVsbG8=".into(),
+            media_type: "image/png".into(),
+        });
+        let req = ChatRequest {
+            messages: vec![msg],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let err = b.chat(req).await.expect_err("must reject");
+        assert!(matches!(err, LlmError::UnsupportedCapability("vision")));
+    }
+
+    #[test]
+    fn maps_tool_choice_strings() {
+        assert!(map_tool_choice(None).is_none());
+        assert!(matches!(
+            map_tool_choice(Some("auto")),
+            Some(rig_core::message::ToolChoice::Auto)
+        ));
+        assert!(matches!(
+            map_tool_choice(Some("none")),
+            Some(rig_core::message::ToolChoice::None)
+        ));
+        assert!(matches!(
+            map_tool_choice(Some("required")),
+            Some(rig_core::message::ToolChoice::Required)
+        ));
+        match map_tool_choice(Some("lookup")) {
+            Some(rig_core::message::ToolChoice::Specific { function_names }) => {
+                assert_eq!(function_names, vec!["lookup".to_string()]);
+            }
+            other => panic!("expected Specific, got {other:?}"),
         }
     }
 
@@ -513,9 +980,9 @@ mod tests {
     #[test]
     fn preamble_lifts_only_system_messages() {
         let messages = vec![
-            system_msg("be concise"),
-            user_msg("hello"),
-            system_msg("answer in english"),
+            ChatMessage::system("be concise"),
+            ChatMessage::user("hello"),
+            ChatMessage::system("answer in english"),
         ];
         let preamble = build_preamble(&messages).expect("preamble");
         assert_eq!(preamble, "be concise\n\nanswer in english");
@@ -523,32 +990,51 @@ mod tests {
 
     #[test]
     fn preamble_returns_none_without_system() {
-        let messages = vec![user_msg("hello")];
+        let messages = vec![ChatMessage::user("hello")];
         assert!(build_preamble(&messages).is_none());
     }
 
     #[test]
-    fn prompt_body_uses_last_user_as_tail() {
-        let messages = vec![
-            user_msg("first turn"),
-            ChatMessage {
-                role: MessageRole::Assistant,
-                content: "first reply".into(),
-                images: vec![],
-            },
-            user_msg("second turn"),
-        ];
-        let body = build_prompt_body(&messages);
-        assert!(body.contains("User: first turn"));
-        assert!(body.contains("Assistant: first reply"));
-        assert!(body.ends_with("second turn"));
+    fn multi_turn_history_maps_each_turn() {
+        let req = ChatRequest {
+            messages: vec![
+                ChatMessage::user("first turn"),
+                ChatMessage::assistant("first reply"),
+                ChatMessage::user("second turn"),
+            ],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let r = build_completion_request(req, ProviderKind::Openai).expect("convert");
+        assert_eq!(r.chat_history.len(), 3);
+        assert!(r.preamble.is_none());
     }
 
     #[test]
-    fn prompt_body_returns_single_user_when_no_history() {
-        let messages = vec![user_msg("only message")];
-        let body = build_prompt_body(&messages);
-        assert_eq!(body, "only message");
+    fn maps_completion_error_variants() {
+        use rig_core::completion::CompletionError;
+        use rig_core::http_client;
+
+        let status = http::StatusCode::TOO_MANY_REQUESTS;
+        match map_completion_error(CompletionError::HttpError(
+            http_client::Error::InvalidStatusCodeWithMessage(status, "slow down".into()),
+        )) {
+            LlmError::Status { status, body } => {
+                assert_eq!(status, 429);
+                assert_eq!(body, "slow down");
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+        assert!(matches!(
+            map_completion_error(CompletionError::ResponseError("bad json".into())),
+            LlmError::Parse(_)
+        ));
+        assert!(matches!(
+            map_completion_error(CompletionError::ProviderError("overloaded".into())),
+            LlmError::Transport(_)
+        ));
     }
 
     #[test]
