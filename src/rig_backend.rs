@@ -370,6 +370,176 @@ fn build_prompt_body(messages: &[super::provider::ChatMessage]) -> String {
     }
 }
 
+/// Default `max_tokens` for Anthropic, which rejects requests without one.
+// wired into chat() in the follow-up commit
+#[allow(dead_code)]
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 4096;
+
+/// Convert a greentic [`ChatRequest`] into rig's provider-agnostic
+/// `CompletionRequest`.
+///
+/// System messages are folded into the preamble; user/assistant/tool turns
+/// become rig chat history. Tool results are encoded as rig `User` messages
+/// carrying `UserContent::ToolResult` keyed by `tool_call_id` (the same id
+/// surfaced by [`map_choice`], so caller-driven tool loops round-trip).
+// wired into chat() in the follow-up commit
+#[allow(dead_code)]
+fn build_completion_request(
+    req: &ChatRequest,
+    kind: ProviderKind,
+) -> Result<rig_core::completion::CompletionRequest, LlmError> {
+    use rig_core::message::{
+        AssistantContent, ImageMediaType, Message, MimeType, ToolResultContent, UserContent,
+    };
+
+    let preamble = build_preamble(&req.messages);
+    let mut history: Vec<Message> = Vec::new();
+    for m in &req.messages {
+        match m.role {
+            MessageRole::System => {} // folded into the preamble
+            MessageRole::User => {
+                let mut content: Vec<UserContent> = Vec::new();
+                if !m.content.is_empty() {
+                    content.push(UserContent::text(m.content.clone()));
+                }
+                for img in &m.images {
+                    content.push(UserContent::image_base64(
+                        img.data_base64.clone(),
+                        ImageMediaType::from_mime_type(&img.media_type),
+                        None,
+                    ));
+                }
+                if content.is_empty() {
+                    content.push(UserContent::text(String::new()));
+                }
+                history.push(Message::User {
+                    content: rig_core::OneOrMany::many(content)
+                        .map_err(|_| LlmError::Parse("empty user content".into()))?,
+                });
+            }
+            MessageRole::Assistant => {
+                let mut content: Vec<AssistantContent> = Vec::new();
+                if !m.content.is_empty() {
+                    content.push(AssistantContent::text(m.content.clone()));
+                }
+                for tc in &m.tool_calls {
+                    content.push(AssistantContent::tool_call(
+                        tc.id.clone(),
+                        tc.name.clone(),
+                        tc.arguments.clone(),
+                    ));
+                }
+                if content.is_empty() {
+                    // Skip empty assistant turns rather than erroring; some
+                    // callers store placeholder assistant rows.
+                    continue;
+                }
+                history.push(Message::Assistant {
+                    id: None,
+                    content: rig_core::OneOrMany::many(content)
+                        .map_err(|_| LlmError::Parse("empty assistant content".into()))?,
+                });
+            }
+            MessageRole::Tool => {
+                let id = m.tool_call_id.clone().unwrap_or_default();
+                history.push(Message::User {
+                    content: rig_core::OneOrMany::one(UserContent::tool_result(
+                        id,
+                        rig_core::OneOrMany::one(ToolResultContent::text(m.content.clone())),
+                    )),
+                });
+            }
+        }
+    }
+    let chat_history = rig_core::OneOrMany::many(history)
+        .map_err(|_| LlmError::Parse("request contained no user/assistant/tool messages".into()))?;
+
+    // Anthropic's API requires max_tokens; default it when the caller did not
+    // set one so requests do not fail provider-side.
+    let max_tokens = req
+        .max_tokens
+        .map(u64::from)
+        .or_else(|| (kind == ProviderKind::Anthropic).then_some(ANTHROPIC_DEFAULT_MAX_TOKENS));
+
+    Ok(rig_core::completion::CompletionRequest {
+        model: None,
+        preamble,
+        chat_history,
+        documents: vec![],
+        tools: req
+            .tools
+            .iter()
+            .map(|t| rig_core::completion::ToolDefinition {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                parameters: t.schema.clone(),
+            })
+            .collect(),
+        temperature: req.temperature.map(f64::from),
+        max_tokens,
+        tool_choice: map_tool_choice(req.tool_choice.as_deref()),
+        additional_params: None,
+        output_schema: None,
+    })
+}
+
+/// Map the greentic `tool_choice` string convention (`"auto"` / `"none"` /
+/// `"required"` / a specific tool name) onto rig's `ToolChoice`.
+// wired into chat() in the follow-up commit
+#[allow(dead_code)]
+fn map_tool_choice(choice: Option<&str>) -> Option<rig_core::message::ToolChoice> {
+    match choice {
+        None => None,
+        Some("auto") => Some(rig_core::message::ToolChoice::Auto),
+        Some("none") => Some(rig_core::message::ToolChoice::None),
+        Some("required") => Some(rig_core::message::ToolChoice::Required),
+        Some(name) => Some(rig_core::message::ToolChoice::Specific {
+            function_names: vec![name.to_string()],
+        }),
+    }
+}
+
+/// Map rig's response choice back onto greentic's [`ChatResponse`].
+///
+/// Text parts are concatenated (newline-joined); tool calls surface the
+/// provider correlation id (`call_id` when present, else `id`) so the caller
+/// can echo it back via [`super::provider::ChatMessage::tool_result`].
+/// Reasoning and image parts are not surfaced through `ChatResponse`.
+// wired into chat() in the follow-up commit
+#[allow(dead_code)]
+fn map_choice(choice: rig_core::OneOrMany<rig_core::message::AssistantContent>) -> ChatResponse {
+    use rig_core::message::AssistantContent;
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    for part in choice {
+        match part {
+            AssistantContent::Text(t) => {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&t.text);
+            }
+            AssistantContent::ToolCall(tc) => tool_calls.push(super::provider::ToolCall {
+                id: tc.call_id.clone().unwrap_or(tc.id),
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+            }),
+            // Reasoning / Image parts are not surfaced through ChatResponse.
+            AssistantContent::Reasoning(_) | AssistantContent::Image(_) => {}
+        }
+    }
+    let finish_reason = if tool_calls.is_empty() {
+        FinishReason::Stop
+    } else {
+        FinishReason::ToolCalls
+    };
+    ChatResponse {
+        content,
+        tool_calls,
+        finish_reason,
+    }
+}
+
 // ============================================================================
 // LlmProvider impl
 // ============================================================================
@@ -472,10 +642,201 @@ impl LlmProvider for RigBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ChatMessage;
+    use crate::provider::{ChatImage, ChatMessage, ToolCall, ToolDef};
 
     fn user_msg(text: &str) -> ChatMessage {
         ChatMessage::user(text)
+    }
+
+    fn tool_request() -> ChatRequest {
+        ChatRequest {
+            messages: vec![
+                ChatMessage::system("you are helpful"),
+                ChatMessage::user("hi"),
+                ChatMessage::assistant_with_tool_calls(
+                    "",
+                    vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "lookup".into(),
+                        arguments: serde_json::json!({"q": "x"}),
+                    }],
+                ),
+                ChatMessage::tool_result("call_1", "{\"answer\":42}"),
+            ],
+            tools: vec![ToolDef {
+                name: "lookup".into(),
+                description: "d".into(),
+                schema: serde_json::json!({"type": "object"}),
+            }],
+            tool_choice: Some("auto".into()),
+            max_tokens: None,
+            temperature: Some(0.2),
+        }
+    }
+
+    #[test]
+    fn builds_completion_request_with_tools_and_history() {
+        let req = tool_request();
+        let r = build_completion_request(&req, ProviderKind::Anthropic).expect("convert");
+        assert_eq!(r.preamble.as_deref(), Some("you are helpful"));
+        assert_eq!(r.tools.len(), 1);
+        assert_eq!(r.tools[0].name, "lookup");
+        assert_eq!(r.max_tokens, Some(4096)); // anthropic default
+        assert_eq!(r.temperature, Some(0.2f32 as f64));
+        assert_eq!(r.chat_history.len(), 3); // user, assistant(tool_call), tool-result
+        assert!(matches!(
+            r.tool_choice,
+            Some(rig_core::message::ToolChoice::Auto)
+        ));
+    }
+
+    #[test]
+    fn non_anthropic_max_tokens_stays_unset() {
+        let req = tool_request();
+        let r = build_completion_request(&req, ProviderKind::Openai).expect("convert");
+        assert_eq!(r.max_tokens, None);
+    }
+
+    #[test]
+    fn tool_call_history_round_trips_through_rig_messages() {
+        // rig response with a Completions-API style call (call_id = None,
+        // id = "call_9") must surface id "call_9"; replaying that id must
+        // land on both the assistant tool_call and the tool_result.
+        let req = tool_request();
+        let r = build_completion_request(&req, ProviderKind::Openai).expect("convert");
+        let history: Vec<_> = r.chat_history.into_iter().collect();
+        match &history[1] {
+            rig_core::message::Message::Assistant { content, .. } => match content.first() {
+                rig_core::message::AssistantContent::ToolCall(tc) => {
+                    assert_eq!(tc.id, "call_1");
+                    assert_eq!(tc.function.name, "lookup");
+                }
+                other => panic!("expected tool call, got {other:?}"),
+            },
+            other => panic!("expected assistant message, got {other:?}"),
+        }
+        match &history[2] {
+            rig_core::message::Message::User { content } => match content.first() {
+                rig_core::message::UserContent::ToolResult(tr) => {
+                    assert_eq!(tr.id, "call_1");
+                }
+                other => panic!("expected tool result, got {other:?}"),
+            },
+            other => panic!("expected user(tool result) message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_choice_with_tool_calls() {
+        let choice = rig_core::OneOrMany::many(vec![
+            rig_core::message::AssistantContent::text("thinking"),
+            rig_core::message::AssistantContent::tool_call(
+                "call_9",
+                "lookup",
+                serde_json::json!({"q": "y"}),
+            ),
+        ])
+        .expect("non-empty");
+        let resp = map_choice(choice);
+        assert_eq!(resp.content, "thinking");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "call_9");
+        assert_eq!(resp.tool_calls[0].name, "lookup");
+        assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[test]
+    fn maps_choice_prefers_call_id_when_present() {
+        let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::ToolCall(
+            rig_core::message::ToolCall::new(
+                "fc_123".into(),
+                rig_core::message::ToolFunction {
+                    name: "lookup".into(),
+                    arguments: serde_json::json!({}),
+                },
+            )
+            .with_call_id("call_abc".into()),
+        ));
+        let resp = map_choice(choice);
+        assert_eq!(resp.tool_calls[0].id, "call_abc");
+    }
+
+    #[test]
+    fn maps_text_only_choice_to_stop() {
+        let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::text("hello"));
+        let resp = map_choice(choice);
+        assert_eq!(resp.content, "hello");
+        assert!(resp.tool_calls.is_empty());
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn user_message_with_image_becomes_image_content() {
+        let mut msg = ChatMessage::user("look at this");
+        msg.images.push(ChatImage {
+            data_base64: "aGVsbG8=".into(),
+            media_type: "image/png".into(),
+        });
+        let req = ChatRequest {
+            messages: vec![msg],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let r = build_completion_request(&req, ProviderKind::Openai).expect("convert");
+        let history: Vec<_> = r.chat_history.into_iter().collect();
+        match &history[0] {
+            rig_core::message::Message::User { content } => {
+                let parts: Vec<_> = content.iter().collect();
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(parts[0], rig_core::message::UserContent::Text(_)));
+                match parts[1] {
+                    rig_core::message::UserContent::Image(img) => {
+                        assert_eq!(img.media_type, Some(rig_core::message::ImageMediaType::PNG));
+                    }
+                    other => panic!("expected image content, got {other:?}"),
+                }
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_system_messages_is_an_error_not_panic() {
+        let req = ChatRequest {
+            messages: vec![ChatMessage::system("only system")],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let err = build_completion_request(&req, ProviderKind::Openai)
+            .expect_err("no chat turns must be an error");
+        assert!(matches!(err, LlmError::Parse(_)));
+    }
+
+    #[test]
+    fn maps_tool_choice_strings() {
+        assert!(map_tool_choice(None).is_none());
+        assert!(matches!(
+            map_tool_choice(Some("auto")),
+            Some(rig_core::message::ToolChoice::Auto)
+        ));
+        assert!(matches!(
+            map_tool_choice(Some("none")),
+            Some(rig_core::message::ToolChoice::None)
+        ));
+        assert!(matches!(
+            map_tool_choice(Some("required")),
+            Some(rig_core::message::ToolChoice::Required)
+        ));
+        match map_tool_choice(Some("lookup")) {
+            Some(rig_core::message::ToolChoice::Specific { function_names }) => {
+                assert_eq!(function_names, vec!["lookup".to_string()]);
+            }
+            other => panic!("expected Specific, got {other:?}"),
+        }
     }
 
     fn system_msg(text: &str) -> ChatMessage {
