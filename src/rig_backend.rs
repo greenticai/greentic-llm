@@ -1,19 +1,27 @@
 //! `RigBackend` — dispatches the [`LlmProvider`] trait to rig-core 0.38
 //! provider clients (plus `rig-bedrock` behind the `bedrock` feature).
 //!
-//! Current scope: text-only chat via `Agent<M>::prompt`. Tool calling and
-//! vision return `LlmError::UnsupportedCapability`; streaming is not yet
-//! implemented and also returns `UnsupportedCapability("streaming")`.
+//! Scope: one-shot chat via rig's low-level completion API, including tool
+//! calling and vision wherever the provider's [`Capabilities`] allow them
+//! (requests that exceed the capability matrix are rejected with
+//! `LlmError::UnsupportedCapability("tools")` / `("vision")`). `chat()`
+//! executes exactly one completion per call — the **caller** drives the tool
+//! loop: dispatch the returned `ChatResponse::tool_calls`, append the
+//! assistant turn via `ChatMessage::assistant_with_tool_calls` plus one
+//! `ChatMessage::tool_result` per call, and invoke `chat()` again. Streaming
+//! is not yet implemented and returns `UnsupportedCapability("streaming")`.
 //!
 //! Architectural note — tools are dynamic
 //! ---------------------------------------
 //! Our `LlmProvider::chat()` accepts `req.tools: Vec<ToolDef>` per call —
 //! tools are runtime-discovered from WASM extensions and may differ between
-//! requests. `rig_core::agent::AgentBuilder::tool(...)` consumes `self`, so we
-//! cannot pre-build an `Agent<M>` and add tools later. `RigBackend` therefore
-//! stores the rig `Client` (provider connection) plus the model name only, and
-//! builds a fresh agent inside `chat()` / `chat_stream()` from the per-request
-//! tools. The underlying HTTP connection in `Client` is reused across calls.
+//! requests, and tool dispatch happens in the caller. That rules out rig's
+//! `Agent` abstraction (tools are baked in at agent build time and rig would
+//! drive the tool loop itself). Instead, `chat()` converts the request once
+//! into rig's provider-agnostic `CompletionRequest` and dispatches it via
+//! `CompletionClient::completion_model()` + `CompletionModel::completion()`.
+//! `RigBackend` stores the rig `Client` (provider connection) plus the model
+//! name; the underlying HTTP connection is reused across calls.
 //!
 //! OpenAI completions API choice
 //! -----------------------------
@@ -37,7 +45,7 @@
 
 use async_trait::async_trait;
 use rig_core::client::CompletionClient;
-use rig_core::completion::Prompt;
+use rig_core::completion::CompletionModel;
 
 use super::capabilities::{Capabilities, ProviderKind};
 use super::credentials::Credential;
@@ -65,8 +73,8 @@ impl RigBackend {
 }
 
 /// One variant per supported provider. Each variant holds the rig provider
-/// `Client` (HTTP connection + auth headers); the `Agent<M>` is built fresh
-/// per `chat()` call because `AgentBuilder::tool` consumes `self`.
+/// `Client` (HTTP connection + auth headers); a `CompletionModel` handle is
+/// created fresh per `chat()` call (cheap — it borrows the client connection).
 ///
 /// Exposed (doc-hidden) for greentic-designer's `rig_agent`, which builds
 /// per-provider `AgentBuilder`s on top of this backend. Not a stable API.
@@ -325,54 +333,7 @@ fn build_preamble(messages: &[super::provider::ChatMessage]) -> Option<String> {
     }
 }
 
-/// Format the conversation history into a single prompt body suitable for
-/// `Agent::prompt()`.
-///
-/// rig's `Prompt::prompt(prompt)` takes a single prompt string (or
-/// `Message`), so we serialise the non-system turns into one body: every turn
-/// before the final user message becomes a `Role: text` line in the history
-/// header, and the final user message is the tail prompt. This mirrors the
-/// existing legacy chat loop's flat-text format.
-fn build_prompt_body(messages: &[super::provider::ChatMessage]) -> String {
-    let last_user_idx = messages
-        .iter()
-        .rposition(|m| matches!(m.role, MessageRole::User))
-        .unwrap_or(messages.len().saturating_sub(1));
-
-    let mut history = String::new();
-    for (idx, msg) in messages.iter().enumerate() {
-        if matches!(msg.role, MessageRole::System) {
-            // already lifted into the preamble
-            continue;
-        }
-        if idx == last_user_idx {
-            // tail handled separately
-            continue;
-        }
-        let role_label = match msg.role {
-            MessageRole::User => "User",
-            MessageRole::Assistant => "Assistant",
-            MessageRole::Tool => "Tool",
-            MessageRole::System => unreachable!("system messages filtered above"),
-        };
-        history.push_str(&format!("{role_label}: {}\n", msg.content));
-    }
-
-    let tail = messages
-        .get(last_user_idx)
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
-
-    if history.is_empty() {
-        tail
-    } else {
-        format!("{history}\n{tail}")
-    }
-}
-
 /// Default `max_tokens` for Anthropic, which rejects requests without one.
-// wired into chat() in the follow-up commit
-#[allow(dead_code)]
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 4096;
 
 /// Convert a greentic [`ChatRequest`] into rig's provider-agnostic
@@ -382,8 +343,6 @@ const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 4096;
 /// become rig chat history. Tool results are encoded as rig `User` messages
 /// carrying `UserContent::ToolResult` keyed by `tool_call_id` (the same id
 /// surfaced by [`map_choice`], so caller-driven tool loops round-trip).
-// wired into chat() in the follow-up commit
-#[allow(dead_code)]
 fn build_completion_request(
     req: &ChatRequest,
     kind: ProviderKind,
@@ -485,8 +444,6 @@ fn build_completion_request(
 
 /// Map the greentic `tool_choice` string convention (`"auto"` / `"none"` /
 /// `"required"` / a specific tool name) onto rig's `ToolChoice`.
-// wired into chat() in the follow-up commit
-#[allow(dead_code)]
 fn map_tool_choice(choice: Option<&str>) -> Option<rig_core::message::ToolChoice> {
     match choice {
         None => None,
@@ -505,8 +462,6 @@ fn map_tool_choice(choice: Option<&str>) -> Option<rig_core::message::ToolChoice
 /// provider correlation id (`call_id` when present, else `id`) so the caller
 /// can echo it back via [`super::provider::ChatMessage::tool_result`].
 /// Reasoning and image parts are not surfaced through `ChatResponse`.
-// wired into chat() in the follow-up commit
-#[allow(dead_code)]
 fn map_choice(choice: rig_core::OneOrMany<rig_core::message::AssistantContent>) -> ChatResponse {
     use rig_core::message::AssistantContent;
     let mut content = String::new();
@@ -540,6 +495,34 @@ fn map_choice(choice: rig_core::OneOrMany<rig_core::message::AssistantContent>) 
     }
 }
 
+/// Map rig's `CompletionError` onto [`LlmError`], preserving HTTP status
+/// codes where rig surfaces them.
+fn map_completion_error(e: rig_core::completion::CompletionError) -> LlmError {
+    use rig_core::completion::CompletionError;
+    use rig_core::http_client;
+    match e {
+        CompletionError::HttpError(http_client::Error::InvalidStatusCode(status)) => {
+            LlmError::Status {
+                status: status.as_u16(),
+                body: String::new(),
+            }
+        }
+        CompletionError::HttpError(http_client::Error::InvalidStatusCodeWithMessage(
+            status,
+            body,
+        )) => LlmError::Status {
+            status: status.as_u16(),
+            body,
+        },
+        CompletionError::HttpError(e) => LlmError::Transport(e.to_string()),
+        CompletionError::JsonError(e) => LlmError::Parse(e.to_string()),
+        CompletionError::UrlError(e) => LlmError::Config(e.to_string()),
+        CompletionError::RequestError(e) => LlmError::Transport(e.to_string()),
+        CompletionError::ResponseError(s) => LlmError::Parse(s),
+        CompletionError::ProviderError(s) => LlmError::Transport(s),
+    }
+}
+
 // ============================================================================
 // LlmProvider impl
 // ============================================================================
@@ -558,77 +541,68 @@ impl LlmProvider for RigBackend {
         &self.model
     }
 
+    /// Execute a single completion (text, tool calling, vision) against the
+    /// configured provider. Requests carrying tools or images are rejected
+    /// up front with `UnsupportedCapability("tools")` / `("vision")` when the
+    /// provider's capability matrix does not advertise the feature.
+    ///
+    /// One call = one completion: when the response carries
+    /// [`FinishReason::ToolCalls`], the caller dispatches the tools and
+    /// replays the conversation (see the module docs for the loop pattern).
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
-        // Text-only chat. Tool calls and vision return UnsupportedCapability
-        // so callers receive a clear error; both surfaces are not yet wired.
-        if !req.tools.is_empty() {
-            return Err(LlmError::UnsupportedCapability("tool_calling_in_chat"));
+        let caps = self.capabilities();
+        if !req.tools.is_empty() && !caps.tools {
+            return Err(LlmError::UnsupportedCapability("tools"));
         }
-        if req.messages.iter().any(|m| !m.images.is_empty()) {
-            return Err(LlmError::UnsupportedCapability("vision_in_chat"));
+        if req.messages.iter().any(|m| !m.images.is_empty()) && !caps.vision {
+            return Err(LlmError::UnsupportedCapability("vision"));
         }
 
-        let preamble = build_preamble(&req.messages);
-        let prompt_body = build_prompt_body(&req.messages);
+        let request = build_completion_request(&req, self.kind)?;
 
-        // Each provider's `Client::agent(model)` returns an `AgentBuilder<M>`
-        // with a different `M` generic, so the dispatch can't be DRY'd into a
+        // Each provider's `completion_model(model)` returns a different
+        // `CompletionModel` type, so the dispatch can't be DRY'd into a
         // helper function (the return type would need to be erased). The
-        // macro below expands one identical block per provider — rebuilding a
-        // fresh agent per call because `AgentBuilder::tool` consumes `self`.
-        // The HTTP connection in the underlying `Client` is reused across calls.
-        macro_rules! run_provider {
+        // macro expands one identical block per provider. NO wildcard arm:
+        // a new `Inner` variant must fail to compile here rather than
+        // silently miss tool support.
+        macro_rules! complete {
             ($client:expr) => {{
-                let mut builder = $client.agent(&self.model);
-                if let Some(preamble_text) = preamble.as_deref() {
-                    builder = builder.preamble(preamble_text);
-                }
-                if let Some(temp) = req.temperature {
-                    builder = builder.temperature(temp as f64);
-                }
-                if let Some(max) = req.max_tokens {
-                    builder = builder.max_tokens(max as u64);
-                }
-                builder
-                    .build()
-                    .prompt(prompt_body.as_str())
+                let model = $client.completion_model(self.model.as_str());
+                let response = model
+                    .completion(request)
                     .await
-                    .map_err(|e| LlmError::Transport(e.to_string()))?
+                    .map_err(map_completion_error)?;
+                Ok(map_choice(response.choice))
             }};
         }
 
-        let text = match &self.inner {
-            Inner::Openai(client) => run_provider!(client),
-            Inner::Anthropic(client) => run_provider!(client),
-            Inner::Deepseek(client) => run_provider!(client),
-            Inner::Gemini(client) => run_provider!(client),
-            Inner::Cohere(client) => run_provider!(client),
-            Inner::Ollama(client) => run_provider!(client),
-            Inner::Groq(client) => run_provider!(client),
-            Inner::Perplexity(client) => run_provider!(client),
-            Inner::Xai(client) => run_provider!(client),
-            Inner::Azure(client) => run_provider!(client),
-            Inner::Mistral(client) => run_provider!(client),
-            Inner::Openrouter(client) => run_provider!(client),
-            Inner::Huggingface(client) => run_provider!(client),
-            Inner::Together(client) => run_provider!(client),
-            Inner::Moonshot(client) => run_provider!(client),
-            Inner::Minimax(client) => run_provider!(client),
-            Inner::Hyperbolic(client) => run_provider!(client),
-            Inner::Galadriel(client) => run_provider!(client),
-            Inner::Mira(client) => run_provider!(client),
-            Inner::Zai(client) => run_provider!(client),
-            Inner::Xiaomimimo(client) => run_provider!(client),
-            Inner::Llamafile(client) => run_provider!(client),
+        match &self.inner {
+            Inner::Openai(client) => complete!(client),
+            Inner::Anthropic(client) => complete!(client),
+            Inner::Deepseek(client) => complete!(client),
+            Inner::Gemini(client) => complete!(client),
+            Inner::Cohere(client) => complete!(client),
+            Inner::Ollama(client) => complete!(client),
+            Inner::Groq(client) => complete!(client),
+            Inner::Perplexity(client) => complete!(client),
+            Inner::Xai(client) => complete!(client),
+            Inner::Azure(client) => complete!(client),
+            Inner::Mistral(client) => complete!(client),
+            Inner::Openrouter(client) => complete!(client),
+            Inner::Huggingface(client) => complete!(client),
+            Inner::Together(client) => complete!(client),
+            Inner::Moonshot(client) => complete!(client),
+            Inner::Minimax(client) => complete!(client),
+            Inner::Hyperbolic(client) => complete!(client),
+            Inner::Galadriel(client) => complete!(client),
+            Inner::Mira(client) => complete!(client),
+            Inner::Zai(client) => complete!(client),
+            Inner::Xiaomimimo(client) => complete!(client),
+            Inner::Llamafile(client) => complete!(client),
             #[cfg(feature = "bedrock")]
-            Inner::Bedrock(client) => run_provider!(client),
-        };
-
-        Ok(ChatResponse {
-            content: text,
-            tool_calls: vec![],
-            finish_reason: FinishReason::Stop,
-        })
+            Inner::Bedrock(client) => complete!(client),
+        }
     }
 
     /// Streaming is not yet implemented by this backend.
@@ -816,6 +790,45 @@ mod tests {
         assert!(matches!(err, LlmError::Parse(_)));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_tools_when_capability_says_no() {
+        // Ollama advertises tools = false.
+        let b = RigBackend::new(ProviderKind::Ollama, "llama3.2", &dummy_cred()).expect("build");
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("hi")],
+            tools: vec![ToolDef {
+                name: "t".into(),
+                description: "d".into(),
+                schema: serde_json::json!({}),
+            }],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let err = b.chat(req).await.expect_err("must reject");
+        assert!(matches!(err, LlmError::UnsupportedCapability("tools")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_images_when_capability_says_no() {
+        // Cohere advertises vision = false.
+        let b = RigBackend::new(ProviderKind::Cohere, "command-r", &dummy_cred()).expect("build");
+        let mut msg = ChatMessage::user("what is this");
+        msg.images.push(ChatImage {
+            data_base64: "aGVsbG8=".into(),
+            media_type: "image/png".into(),
+        });
+        let req = ChatRequest {
+            messages: vec![msg],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let err = b.chat(req).await.expect_err("must reject");
+        assert!(matches!(err, LlmError::UnsupportedCapability("vision")));
+    }
+
     #[test]
     fn maps_tool_choice_strings() {
         assert!(map_tool_choice(None).is_none());
@@ -881,23 +894,46 @@ mod tests {
     }
 
     #[test]
-    fn prompt_body_uses_last_user_as_tail() {
-        let messages = vec![
-            user_msg("first turn"),
-            ChatMessage::assistant("first reply"),
-            user_msg("second turn"),
-        ];
-        let body = build_prompt_body(&messages);
-        assert!(body.contains("User: first turn"));
-        assert!(body.contains("Assistant: first reply"));
-        assert!(body.ends_with("second turn"));
+    fn multi_turn_history_maps_each_turn() {
+        let req = ChatRequest {
+            messages: vec![
+                user_msg("first turn"),
+                ChatMessage::assistant("first reply"),
+                user_msg("second turn"),
+            ],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let r = build_completion_request(&req, ProviderKind::Openai).expect("convert");
+        assert_eq!(r.chat_history.len(), 3);
+        assert!(r.preamble.is_none());
     }
 
     #[test]
-    fn prompt_body_returns_single_user_when_no_history() {
-        let messages = vec![user_msg("only message")];
-        let body = build_prompt_body(&messages);
-        assert_eq!(body, "only message");
+    fn maps_completion_error_variants() {
+        use rig_core::completion::CompletionError;
+        use rig_core::http_client;
+
+        let status = http::StatusCode::TOO_MANY_REQUESTS;
+        match map_completion_error(CompletionError::HttpError(
+            http_client::Error::InvalidStatusCodeWithMessage(status, "slow down".into()),
+        )) {
+            LlmError::Status { status, body } => {
+                assert_eq!(status, 429);
+                assert_eq!(body, "slow down");
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+        assert!(matches!(
+            map_completion_error(CompletionError::ResponseError("bad json".into())),
+            LlmError::Parse(_)
+        ));
+        assert!(matches!(
+            map_completion_error(CompletionError::ProviderError("overloaded".into())),
+            LlmError::Transport(_)
+        ));
     }
 
     #[test]
