@@ -26,9 +26,10 @@
 //! OpenAI completions API choice
 //! -----------------------------
 //! rig's default `openai::Client` posts to `/responses` (Responses API).
-//! Our wiremock test speaks Chat Completions, so we explicitly use
-//! `openai::CompletionsClient` here. Work that needs Responses API features
-//! (built-in tools, web search) can opt in via a new `ProviderKind` variant.
+//! We explicitly use `openai::CompletionsClient` here so requests go to the
+//! Chat Completions endpoint, which is what OpenAI-compatible gateways and
+//! self-hosted shims speak. Work that needs Responses API features (built-in
+//! tools, web search) can opt in via a new `ProviderKind` variant.
 //!
 //! Provider-specific construction
 //! ------------------------------
@@ -319,7 +320,7 @@ impl RigBackend {
 
 /// Concatenate every `System` message in the request into a single preamble
 /// string. Returns `None` if no system message is present (rig's
-/// `AgentBuilder::preamble` is optional).
+/// `CompletionRequest::preamble` is optional).
 fn build_preamble(messages: &[super::provider::ChatMessage]) -> Option<String> {
     let parts: Vec<String> = messages
         .iter()
@@ -343,30 +344,33 @@ const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 4096;
 /// become rig chat history. Tool results are encoded as rig `User` messages
 /// carrying `UserContent::ToolResult` keyed by `tool_call_id` (the same id
 /// surfaced by [`map_choice`], so caller-driven tool loops round-trip).
+///
+/// Consumes the request so message payloads (notably base64 image data, which
+/// can be multiple megabytes) move into the rig request instead of being
+/// cloned.
 fn build_completion_request(
-    req: &ChatRequest,
+    req: ChatRequest,
     kind: ProviderKind,
 ) -> Result<rig_core::completion::CompletionRequest, LlmError> {
     use rig_core::message::{
         AssistantContent, ImageMediaType, Message, MimeType, ToolResultContent, UserContent,
     };
 
+    // Build the preamble while the messages are still borrowable; the loop
+    // below consumes them.
     let preamble = build_preamble(&req.messages);
     let mut history: Vec<Message> = Vec::new();
-    for m in &req.messages {
+    for m in req.messages {
         match m.role {
             MessageRole::System => {} // folded into the preamble
             MessageRole::User => {
                 let mut content: Vec<UserContent> = Vec::new();
                 if !m.content.is_empty() {
-                    content.push(UserContent::text(m.content.clone()));
+                    content.push(UserContent::text(m.content));
                 }
-                for img in &m.images {
-                    content.push(UserContent::image_base64(
-                        img.data_base64.clone(),
-                        ImageMediaType::from_mime_type(&img.media_type),
-                        None,
-                    ));
+                for img in m.images {
+                    let media_type = ImageMediaType::from_mime_type(&img.media_type);
+                    content.push(UserContent::image_base64(img.data_base64, media_type, None));
                 }
                 if content.is_empty() {
                     content.push(UserContent::text(String::new()));
@@ -379,14 +383,10 @@ fn build_completion_request(
             MessageRole::Assistant => {
                 let mut content: Vec<AssistantContent> = Vec::new();
                 if !m.content.is_empty() {
-                    content.push(AssistantContent::text(m.content.clone()));
+                    content.push(AssistantContent::text(m.content));
                 }
-                for tc in &m.tool_calls {
-                    content.push(AssistantContent::tool_call(
-                        tc.id.clone(),
-                        tc.name.clone(),
-                        tc.arguments.clone(),
-                    ));
+                for tc in m.tool_calls {
+                    content.push(AssistantContent::tool_call(tc.id, tc.name, tc.arguments));
                 }
                 if content.is_empty() {
                     // Skip empty assistant turns rather than erroring; some
@@ -400,11 +400,16 @@ fn build_completion_request(
                 });
             }
             MessageRole::Tool => {
-                let id = m.tool_call_id.clone().unwrap_or_default();
+                // Providers key tool results to the originating call; an
+                // unkeyed result would be silently misattributed, so fail
+                // fast instead of sending an empty id.
+                let id = m
+                    .tool_call_id
+                    .ok_or_else(|| LlmError::Parse("tool message missing tool_call_id".into()))?;
                 history.push(Message::User {
                     content: rig_core::OneOrMany::one(UserContent::tool_result(
                         id,
-                        rig_core::OneOrMany::one(ToolResultContent::text(m.content.clone())),
+                        rig_core::OneOrMany::one(ToolResultContent::text(m.content)),
                     )),
                 });
             }
@@ -427,11 +432,11 @@ fn build_completion_request(
         documents: vec![],
         tools: req
             .tools
-            .iter()
+            .into_iter()
             .map(|t| rig_core::completion::ToolDefinition {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                parameters: t.schema.clone(),
+                name: t.name,
+                description: t.description,
+                parameters: t.schema,
             })
             .collect(),
         temperature: req.temperature.map(f64::from),
@@ -475,7 +480,7 @@ fn map_choice(choice: rig_core::OneOrMany<rig_core::message::AssistantContent>) 
                 content.push_str(&t.text);
             }
             AssistantContent::ToolCall(tc) => tool_calls.push(super::provider::ToolCall {
-                id: tc.call_id.clone().unwrap_or(tc.id),
+                id: tc.call_id.unwrap_or(tc.id),
                 name: tc.function.name,
                 arguments: tc.function.arguments,
             }),
@@ -558,7 +563,7 @@ impl LlmProvider for RigBackend {
             return Err(LlmError::UnsupportedCapability("vision"));
         }
 
-        let request = build_completion_request(&req, self.kind)?;
+        let request = build_completion_request(req, self.kind)?;
 
         // Each provider's `completion_model(model)` returns a different
         // `CompletionModel` type, so the dispatch can't be DRY'd into a
@@ -618,10 +623,6 @@ mod tests {
     use super::*;
     use crate::provider::{ChatImage, ChatMessage, ToolCall, ToolDef};
 
-    fn user_msg(text: &str) -> ChatMessage {
-        ChatMessage::user(text)
-    }
-
     fn tool_request() -> ChatRequest {
         ChatRequest {
             messages: vec![
@@ -650,8 +651,7 @@ mod tests {
 
     #[test]
     fn builds_completion_request_with_tools_and_history() {
-        let req = tool_request();
-        let r = build_completion_request(&req, ProviderKind::Anthropic).expect("convert");
+        let r = build_completion_request(tool_request(), ProviderKind::Anthropic).expect("convert");
         assert_eq!(r.preamble.as_deref(), Some("you are helpful"));
         assert_eq!(r.tools.len(), 1);
         assert_eq!(r.tools[0].name, "lookup");
@@ -666,8 +666,7 @@ mod tests {
 
     #[test]
     fn non_anthropic_max_tokens_stays_unset() {
-        let req = tool_request();
-        let r = build_completion_request(&req, ProviderKind::Openai).expect("convert");
+        let r = build_completion_request(tool_request(), ProviderKind::Openai).expect("convert");
         assert_eq!(r.max_tokens, None);
     }
 
@@ -676,8 +675,7 @@ mod tests {
         // rig response with a Completions-API style call (call_id = None,
         // id = "call_9") must surface id "call_9"; replaying that id must
         // land on both the assistant tool_call and the tool_result.
-        let req = tool_request();
-        let r = build_completion_request(&req, ProviderKind::Openai).expect("convert");
+        let r = build_completion_request(tool_request(), ProviderKind::Openai).expect("convert");
         let history: Vec<_> = r.chat_history.into_iter().collect();
         match &history[1] {
             rig_core::message::Message::Assistant { content, .. } => match content.first() {
@@ -758,7 +756,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
         };
-        let r = build_completion_request(&req, ProviderKind::Openai).expect("convert");
+        let r = build_completion_request(req, ProviderKind::Openai).expect("convert");
         let history: Vec<_> = r.chat_history.into_iter().collect();
         match &history[0] {
             rig_core::message::Message::User { content } => {
@@ -777,6 +775,113 @@ mod tests {
     }
 
     #[test]
+    fn unknown_image_mime_type_passes_through_as_none() {
+        let mut msg = ChatMessage::user("look at this");
+        msg.images.push(ChatImage {
+            data_base64: "aGVsbG8=".into(),
+            media_type: "image/x-unknown".into(),
+        });
+        let req = ChatRequest {
+            messages: vec![msg],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let r = build_completion_request(req, ProviderKind::Openai).expect("convert");
+        let history: Vec<_> = r.chat_history.into_iter().collect();
+        match &history[0] {
+            rig_core::message::Message::User { content } => {
+                let parts: Vec<_> = content.iter().collect();
+                match parts[1] {
+                    rig_core::message::UserContent::Image(img) => {
+                        assert_eq!(img.media_type, None);
+                    }
+                    other => panic!("expected image content, got {other:?}"),
+                }
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_image_user_message_keeps_text_then_images_in_order() {
+        let mut msg = ChatMessage::user("two pictures");
+        msg.images.push(ChatImage {
+            data_base64: "Zmlyc3Q=".into(),
+            media_type: "image/png".into(),
+        });
+        msg.images.push(ChatImage {
+            data_base64: "c2Vjb25k".into(),
+            media_type: "image/jpeg".into(),
+        });
+        let req = ChatRequest {
+            messages: vec![msg],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let r = build_completion_request(req, ProviderKind::Openai).expect("convert");
+        let history: Vec<_> = r.chat_history.into_iter().collect();
+        match &history[0] {
+            rig_core::message::Message::User { content } => {
+                let parts: Vec<_> = content.iter().collect();
+                assert_eq!(parts.len(), 3);
+                match parts[0] {
+                    rig_core::message::UserContent::Text(t) => {
+                        assert_eq!(t.text, "two pictures");
+                    }
+                    other => panic!("expected text content, got {other:?}"),
+                }
+                let expected = [
+                    ("Zmlyc3Q=", rig_core::message::ImageMediaType::PNG),
+                    ("c2Vjb25k", rig_core::message::ImageMediaType::JPEG),
+                ];
+                for (part, (data, media_type)) in parts[1..].iter().zip(expected) {
+                    match part {
+                        rig_core::message::UserContent::Image(img) => {
+                            assert_eq!(img.media_type, Some(media_type));
+                            match &img.data {
+                                rig_core::message::DocumentSourceKind::Base64(b64) => {
+                                    assert_eq!(b64, data);
+                                }
+                                other => panic!("expected base64 image data, got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected image content, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_message_without_tool_call_id_is_a_parse_error() {
+        let unkeyed_tool_msg = ChatMessage {
+            role: MessageRole::Tool,
+            content: "{\"answer\":42}".into(),
+            images: vec![],
+            tool_calls: vec![],
+            tool_call_id: None,
+        };
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("hi"), unkeyed_tool_msg],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let err = build_completion_request(req, ProviderKind::Openai)
+            .expect_err("unkeyed tool result must be rejected");
+        match err {
+            LlmError::Parse(msg) => assert!(msg.contains("tool_call_id"), "message: {msg}"),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn all_system_messages_is_an_error_not_panic() {
         let req = ChatRequest {
             messages: vec![ChatMessage::system("only system")],
@@ -785,7 +890,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
         };
-        let err = build_completion_request(&req, ProviderKind::Openai)
+        let err = build_completion_request(req, ProviderKind::Openai)
             .expect_err("no chat turns must be an error");
         assert!(matches!(err, LlmError::Parse(_)));
     }
@@ -852,10 +957,6 @@ mod tests {
         }
     }
 
-    fn system_msg(text: &str) -> ChatMessage {
-        ChatMessage::system(text)
-    }
-
     fn dummy_cred() -> Credential {
         // `Credential` implements `Drop` (zeroize), so struct-update syntax
         // is unavailable; spell out every field.
@@ -879,9 +980,9 @@ mod tests {
     #[test]
     fn preamble_lifts_only_system_messages() {
         let messages = vec![
-            system_msg("be concise"),
-            user_msg("hello"),
-            system_msg("answer in english"),
+            ChatMessage::system("be concise"),
+            ChatMessage::user("hello"),
+            ChatMessage::system("answer in english"),
         ];
         let preamble = build_preamble(&messages).expect("preamble");
         assert_eq!(preamble, "be concise\n\nanswer in english");
@@ -889,7 +990,7 @@ mod tests {
 
     #[test]
     fn preamble_returns_none_without_system() {
-        let messages = vec![user_msg("hello")];
+        let messages = vec![ChatMessage::user("hello")];
         assert!(build_preamble(&messages).is_none());
     }
 
@@ -897,16 +998,16 @@ mod tests {
     fn multi_turn_history_maps_each_turn() {
         let req = ChatRequest {
             messages: vec![
-                user_msg("first turn"),
+                ChatMessage::user("first turn"),
                 ChatMessage::assistant("first reply"),
-                user_msg("second turn"),
+                ChatMessage::user("second turn"),
             ],
             tools: vec![],
             tool_choice: None,
             max_tokens: None,
             temperature: None,
         };
-        let r = build_completion_request(&req, ProviderKind::Openai).expect("convert");
+        let r = build_completion_request(req, ProviderKind::Openai).expect("convert");
         assert_eq!(r.chat_history.len(), 3);
         assert!(r.preamble.is_none());
     }
