@@ -475,19 +475,11 @@ mod tests {
     use crate::provider::ChatMessage;
 
     fn user_msg(text: &str) -> ChatMessage {
-        ChatMessage {
-            role: MessageRole::User,
-            content: text.into(),
-            images: vec![],
-        }
+        ChatMessage::user(text)
     }
 
     fn system_msg(text: &str) -> ChatMessage {
-        ChatMessage {
-            role: MessageRole::System,
-            content: text.into(),
-            images: vec![],
-        }
+        ChatMessage::system(text)
     }
 
     fn dummy_cred() -> Credential {
@@ -531,11 +523,7 @@ mod tests {
     fn prompt_body_uses_last_user_as_tail() {
         let messages = vec![
             user_msg("first turn"),
-            ChatMessage {
-                role: MessageRole::Assistant,
-                content: "first reply".into(),
-                images: vec![],
-            },
+            ChatMessage::assistant("first reply"),
             user_msg("second turn"),
         ];
         let body = build_prompt_body(&messages);

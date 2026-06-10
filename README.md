@@ -32,7 +32,7 @@ Provider-specific notes:
 ```rust
 use greentic_llm::{
     ChatMessage, ChatRequest, CredentialSource, EnvCredentialSource,
-    LlmProvider, MessageRole, ProviderKind, RigBackend,
+    LlmProvider, ProviderKind, RigBackend,
 };
 
 let credential = EnvCredentialSource
@@ -42,11 +42,7 @@ let credential = EnvCredentialSource
 let backend = RigBackend::new(ProviderKind::Openai, "gpt-4o", &credential)?;
 let response = backend
     .chat(ChatRequest {
-        messages: vec![ChatMessage {
-            role: MessageRole::User,
-            content: "hello".into(),
-            images: vec![],
-        }],
+        messages: vec![ChatMessage::user("hello")],
         tools: vec![],
         tool_choice: None,
         max_tokens: None,
