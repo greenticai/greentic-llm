@@ -376,7 +376,12 @@ fn build_preamble(messages: &[super::provider::ChatMessage]) -> Option<String> {
 }
 
 /// Default `max_tokens` for Anthropic, which rejects requests without one.
-const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 4096;
+///
+/// Deliberately generous: a small default (e.g. 4096) silently truncates rich
+/// responses such as multi-card AdaptiveCard flows inlined in a single reply.
+/// Callers that want a tighter budget can always pass an explicit
+/// `max_tokens`; this constant only applies when none is provided.
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 32_768;
 
 /// Convert a greentic [`ChatRequest`] into rig's provider-agnostic
 /// `CompletionRequest`.
@@ -697,7 +702,7 @@ mod tests {
         assert_eq!(r.preamble.as_deref(), Some("you are helpful"));
         assert_eq!(r.tools.len(), 1);
         assert_eq!(r.tools[0].name, "lookup");
-        assert_eq!(r.max_tokens, Some(4096)); // anthropic default
+        assert_eq!(r.max_tokens, Some(32_768)); // anthropic default
         assert_eq!(r.temperature, Some(0.2f32 as f64));
         assert_eq!(r.chat_history.len(), 3); // user, assistant(tool_call), tool-result
         assert!(matches!(
