@@ -134,6 +134,10 @@ pub enum LlmError {
     Parse(String),
     #[error("capability '{0}' not supported by this provider")]
     UnsupportedCapability(&'static str),
+    /// The provider was configured incorrectly (missing endpoint, unsupported
+    /// option, or a backend compiled out via cargo features).
+    #[error("invalid provider configuration: {0}")]
+    Config(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
