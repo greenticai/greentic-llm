@@ -1,6 +1,6 @@
 [package]
 name = "greentic-llm"
-version = "1.2.6-research"
+version = "1.2.7-research"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
