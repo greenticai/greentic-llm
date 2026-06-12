@@ -595,6 +595,7 @@ fn streamed_to_events<R>(
                 .filter_map(|c| match c {
                     ReasoningContent::Text { text, .. } => Some(text),
                     ReasoningContent::Summary(s) => Some(s),
+                    // Encrypted/redacted reasoning blocks have no displayable text.
                     _ => None,
                 })
                 .collect();
@@ -751,6 +752,15 @@ impl LlmProvider for RigBackend {
                     };
                     futures_util::stream::iter(evs)
                 });
+                // Always append a synthetic terminal `Done` so consumers have a
+                // clean end-of-stream marker. Contract: a preceding `Err` item
+                // means the turn FAILED — consumers must treat the first `Err`
+                // as terminal and ignore any trailing `Done`. `finish_reason`
+                // is a streaming placeholder (`Stop`); unlike non-streaming
+                // `chat()` (which derives Stop/ToolCalls/Length in
+                // `map_choice`), the streaming path does not surface a real
+                // finish reason — derive it from observed tool-call events if
+                // you need one.
                 let with_done = mapped.chain(futures_util::stream::once(async {
                     Ok(StreamEvent::Done {
                         finish_reason: FinishReason::Stop,
