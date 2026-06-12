@@ -172,6 +172,10 @@ pub enum FinishReason {
 pub enum StreamEvent {
     /// Incremental assistant text.
     TextChunk(String),
+    /// Incremental assistant reasoning ("thinking") text. Emitted only by
+    /// providers/models that surface reasoning deltas (e.g. OpenAI-compatible
+    /// `reasoning_content`, Anthropic thinking). Phase 2.
+    ReasoningDelta { reasoning: String },
     /// Start marker for a tool call (id + name known, args incoming).
     ToolCallStart { id: String, name: String },
     /// Partial tool-call argument delta (provider-specific JSON fragment).
