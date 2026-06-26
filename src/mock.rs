@@ -6,7 +6,8 @@
 //! tests or downstream crates that need a controllable LLM backend.
 //!
 //! The current surface supports capability override, a canned fallback text
-//! response, and a scripted FIFO response queue.
+//! response, a scripted FIFO response queue, and request capture
+//! ([`TestLlmProvider::captured_requests`]) so tests can assert what was sent.
 
 #![cfg(any(test, feature = "test-mock"))]
 
@@ -29,6 +30,22 @@ pub struct TestLlmProvider {
     model: String,
     response_text: String,
     scripted: Mutex<VecDeque<ChatResponse>>,
+    captured: Mutex<Vec<ChatRequest>>,
+    /// Optional scripted streaming events. When set, `chat_stream` replays
+    /// these verbatim instead of the canned text+Done default.
+    stream_script: Mutex<Option<Vec<StreamEvent>>>,
+}
+
+impl TestLlmProvider {
+    /// Returns every [`ChatRequest`] passed to [`LlmProvider::chat`] so far,
+    /// in call order. Lets downstream tests assert what was sent (messages,
+    /// tools, tool_choice) rather than only what came back.
+    pub fn captured_requests(&self) -> Vec<ChatRequest> {
+        self.captured
+            .lock()
+            .expect("mock capture mutex poisoned")
+            .clone()
+    }
 }
 
 impl Default for TestLlmProvider {
@@ -45,18 +62,22 @@ impl Default for TestLlmProvider {
             model: "mock-model".into(),
             response_text: "mock response".into(),
             scripted: Mutex::new(VecDeque::new()),
+            captured: Mutex::new(Vec::new()),
+            stream_script: Mutex::new(None),
         }
     }
 }
 
 pub struct TestLlmProviderBuilder {
     inner: TestLlmProvider,
+    stream_script: Option<Vec<StreamEvent>>,
 }
 
 impl TestLlmProviderBuilder {
     pub fn new() -> Self {
         Self {
             inner: TestLlmProvider::default(),
+            stream_script: None,
         }
     }
 
@@ -94,8 +115,23 @@ impl TestLlmProviderBuilder {
         self
     }
 
+    /// Script the exact [`StreamEvent`] sequence `chat_stream` will yield.
+    ///
+    /// When set, `chat_stream` replays these events verbatim (in order) instead
+    /// of the canned `TextChunk + Done` default. The script is consumed on the
+    /// first `chat_stream` call; subsequent calls fall back to the default.
+    pub fn stream_script(mut self, events: Vec<StreamEvent>) -> Self {
+        self.stream_script = Some(events);
+        self
+    }
+
     pub fn build(self) -> TestLlmProvider {
-        self.inner
+        let mut provider = self.inner;
+        *provider
+            .stream_script
+            .get_mut()
+            .expect("mock stream_script mutex poisoned") = self.stream_script;
+        provider
     }
 }
 
@@ -119,7 +155,11 @@ impl LlmProvider for TestLlmProvider {
         &self.model
     }
 
-    async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse, LlmError> {
+    async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.captured
+            .lock()
+            .expect("mock capture mutex poisoned")
+            .push(req);
         if let Some(scripted) = self
             .scripted
             .lock()
@@ -139,6 +179,15 @@ impl LlmProvider for TestLlmProvider {
         if !self.capabilities.streaming {
             return Err(LlmError::UnsupportedCapability("streaming"));
         }
+        if let Some(script) = self
+            .stream_script
+            .lock()
+            .expect("mock stream_script mutex poisoned")
+            .take()
+        {
+            let events: Vec<Result<StreamEvent, LlmError>> = script.into_iter().map(Ok).collect();
+            return Ok(stream::iter(events).boxed());
+        }
         let text = self.response_text.clone();
         let events = vec![
             Ok(StreamEvent::TextChunk(text)),
@@ -153,7 +202,7 @@ impl LlmProvider for TestLlmProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ToolCall;
+    use crate::provider::{FinishReason, StreamEvent, ToolCall};
 
     fn req() -> ChatRequest {
         ChatRequest {
@@ -163,6 +212,23 @@ mod tests {
             max_tokens: None,
             temperature: None,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_captures_requests() {
+        use crate::provider::ChatMessage;
+
+        let provider = TestLlmProviderBuilder::new().response_text("ok").build();
+        assert!(provider.captured_requests().is_empty());
+
+        let mut request = req();
+        request.messages.push(ChatMessage::user("hi"));
+        provider.chat(request).await.expect("mock chat succeeds");
+
+        let captured = provider.captured_requests();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].messages.len(), 1);
+        assert_eq!(captured[0].messages[0].content, "hi");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -194,5 +260,43 @@ mod tests {
 
         let third = provider.chat(req()).await.unwrap();
         assert_eq!(third.content, "fallback");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_stream_replays_scripted_events() {
+        use futures_util::StreamExt;
+
+        let provider = TestLlmProviderBuilder::new()
+            .stream_script(vec![
+                StreamEvent::ReasoningDelta {
+                    reasoning: "think".into(),
+                },
+                StreamEvent::TextChunk("Hel".into()),
+                StreamEvent::TextChunk("lo".into()),
+                StreamEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                },
+            ])
+            .build();
+
+        let mut stream = provider
+            .chat_stream(ChatRequest {
+                messages: vec![],
+                tools: vec![],
+                tool_choice: None,
+                max_tokens: None,
+                temperature: None,
+            })
+            .await
+            .expect("stream");
+
+        let mut kinds = Vec::new();
+        while let Some(ev) = stream.next().await {
+            kinds.push(format!("{:?}", ev.expect("ok event")));
+        }
+
+        assert!(kinds[0].contains("ReasoningDelta"));
+        assert!(kinds.iter().any(|k| k.contains("TextChunk")));
+        assert!(kinds.last().unwrap().contains("Done"));
     }
 }
