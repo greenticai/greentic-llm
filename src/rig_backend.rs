@@ -773,7 +773,12 @@ mod tests {
             ),
         ])
         .expect("non-empty");
-        let resp = map_choice(choice, rig_core::completion::Usage::new(), None, "test-model");
+        let resp = map_choice(
+            choice,
+            rig_core::completion::Usage::new(),
+            None,
+            "test-model",
+        );
         assert_eq!(resp.content, "thinking");
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].id, "call_9");
@@ -793,14 +798,24 @@ mod tests {
             )
             .with_call_id("call_abc".into()),
         ));
-        let resp = map_choice(choice, rig_core::completion::Usage::new(), None, "test-model");
+        let resp = map_choice(
+            choice,
+            rig_core::completion::Usage::new(),
+            None,
+            "test-model",
+        );
         assert_eq!(resp.tool_calls[0].id, "call_abc");
     }
 
     #[test]
     fn maps_text_only_choice_to_stop() {
         let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::text("hello"));
-        let resp = map_choice(choice, rig_core::completion::Usage::new(), None, "test-model");
+        let resp = map_choice(
+            choice,
+            rig_core::completion::Usage::new(),
+            None,
+            "test-model",
+        );
         assert_eq!(resp.content, "hello");
         assert!(resp.tool_calls.is_empty());
         assert_eq!(resp.finish_reason, FinishReason::Stop);
@@ -821,7 +836,12 @@ mod tests {
         // rig's Usage contract: output_tokens == 0 means the provider did not
         // report usage — never infer truncation from it, even with a cap set.
         let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::text("hello"));
-        let resp = map_choice(choice, rig_core::completion::Usage::new(), Some(1), "test-model");
+        let resp = map_choice(
+            choice,
+            rig_core::completion::Usage::new(),
+            Some(1),
+            "test-model",
+        );
         assert_eq!(resp.finish_reason, FinishReason::Stop);
 
         // Below-cap usage with a cap set is also a normal stop.
