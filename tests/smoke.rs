@@ -3,7 +3,7 @@
 #![cfg(feature = "test-mock")]
 
 use greentic_llm::mock::TestLlmProviderBuilder;
-use greentic_llm::{ChatMessage, ChatRequest, FinishReason, LlmProvider, MessageRole};
+use greentic_llm::{ChatMessage, ChatRequest, FinishReason, LlmProvider};
 
 #[tokio::test(flavor = "current_thread")]
 async fn mock_provider_round_trip() {
@@ -12,11 +12,7 @@ async fn mock_provider_round_trip() {
         .build();
     let response = provider
         .chat(ChatRequest {
-            messages: vec![ChatMessage {
-                role: MessageRole::User,
-                content: "hi".into(),
-                images: vec![],
-            }],
+            messages: vec![ChatMessage::user("hi")],
             tools: vec![],
             tool_choice: None,
             max_tokens: None,

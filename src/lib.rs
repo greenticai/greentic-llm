@@ -10,14 +10,12 @@ pub mod credentials;
 #[cfg(any(test, feature = "test-mock"))]
 pub mod mock;
 pub mod provider;
-#[cfg(feature = "rig")]
 pub mod rig_backend;
 
 pub use capabilities::{Capabilities, ProviderKind};
 pub use credentials::{CredError, Credential, CredentialSource, EnvCredentialSource};
 pub use provider::{
     ChatImage, ChatMessage, ChatRequest, ChatResponse, ChatStream, FinishReason, LlmError,
-    LlmProvider, MessageRole, StreamEvent, ToolCall, ToolDef,
+    LlmProvider, MessageRole, StreamEvent, ToolCall, ToolDef, Usage,
 };
-#[cfg(feature = "rig")]
 pub use rig_backend::RigBackend;

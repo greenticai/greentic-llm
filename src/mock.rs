@@ -6,7 +6,8 @@
 //! tests or downstream crates that need a controllable LLM backend.
 //!
 //! The current surface supports capability override, a canned fallback text
-//! response, and a scripted FIFO response queue.
+//! response, a scripted FIFO response queue, and request capture
+//! ([`TestLlmProvider::captured_requests`]) so tests can assert what was sent.
 
 #![cfg(any(test, feature = "test-mock"))]
 
@@ -29,6 +30,19 @@ pub struct TestLlmProvider {
     model: String,
     response_text: String,
     scripted: Mutex<VecDeque<ChatResponse>>,
+    captured: Mutex<Vec<ChatRequest>>,
+}
+
+impl TestLlmProvider {
+    /// Returns every [`ChatRequest`] passed to [`LlmProvider::chat`] so far,
+    /// in call order. Lets downstream tests assert what was sent (messages,
+    /// tools, tool_choice) rather than only what came back.
+    pub fn captured_requests(&self) -> Vec<ChatRequest> {
+        self.captured
+            .lock()
+            .expect("mock capture mutex poisoned")
+            .clone()
+    }
 }
 
 impl Default for TestLlmProvider {
@@ -45,6 +59,7 @@ impl Default for TestLlmProvider {
             model: "mock-model".into(),
             response_text: "mock response".into(),
             scripted: Mutex::new(VecDeque::new()),
+            captured: Mutex::new(Vec::new()),
         }
     }
 }
@@ -119,7 +134,11 @@ impl LlmProvider for TestLlmProvider {
         &self.model
     }
 
-    async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse, LlmError> {
+    async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.captured
+            .lock()
+            .expect("mock capture mutex poisoned")
+            .push(req);
         if let Some(scripted) = self
             .scripted
             .lock()
@@ -132,6 +151,7 @@ impl LlmProvider for TestLlmProvider {
             content: self.response_text.clone(),
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,
+            usage: None,
         })
     }
 
@@ -166,6 +186,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn mock_captures_requests() {
+        use crate::provider::ChatMessage;
+
+        let provider = TestLlmProviderBuilder::new().response_text("ok").build();
+        assert!(provider.captured_requests().is_empty());
+
+        let mut request = req();
+        request.messages.push(ChatMessage::user("hi"));
+        provider.chat(request).await.expect("mock chat succeeds");
+
+        let captured = provider.captured_requests();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].messages.len(), 1);
+        assert_eq!(captured[0].messages[0].content, "hi");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn scripted_responses_are_returned_in_order_then_fall_back() {
         let provider = TestLlmProviderBuilder::new()
             .response_text("fallback")
@@ -177,11 +214,13 @@ mod tests {
                     arguments: serde_json::json!({"name": "first"}),
                 }],
                 finish_reason: FinishReason::ToolCalls,
+                usage: None,
             })
             .script_response(ChatResponse {
                 content: "second".into(),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
+                usage: None,
             })
             .build();
 
