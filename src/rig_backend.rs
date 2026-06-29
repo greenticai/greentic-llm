@@ -57,8 +57,7 @@ use rig_core::completion::CompletionModel;
 use super::capabilities::{Capabilities, ProviderKind};
 use super::credentials::Credential;
 use super::provider::{
-    ChatRequest, ChatResponse, ChatStream, FinishReason, LlmError, LlmProvider, MessageRole,
-    StreamEvent,
+    ChatRequest, ChatResponse, ChatStream, FinishReason, LlmError, LlmProvider, MessageRole, Usage,
 };
 
 /// Backend that dispatches `LlmProvider` calls to rig provider clients.
@@ -504,10 +503,15 @@ fn map_tool_choice(choice: Option<&str>) -> Option<rig_core::message::ToolChoice
 /// requested `max_tokens` cap, the response was cut off and the finish reason
 /// is [`FinishReason::Length`]. Providers that report no usage
 /// (`output_tokens == 0` per rig's `Usage` contract) never report `Length`.
+///
+/// `model` is the active model id; it is forwarded verbatim into
+/// [`Usage::model`] so callers can attribute cost without keeping a separate
+/// reference to the backend configuration.
 fn map_choice(
     choice: rig_core::OneOrMany<rig_core::message::AssistantContent>,
     usage: rig_core::completion::Usage,
     requested_max_tokens: Option<u64>,
+    model: &str,
 ) -> ChatResponse {
     use rig_core::message::AssistantContent;
     let mut content = String::new();
@@ -538,10 +542,16 @@ fn map_choice(
     } else {
         FinishReason::Stop
     };
+    let token_usage = Usage {
+        model: model.to_string(),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+    };
     ChatResponse {
         content,
         tool_calls,
         finish_reason,
+        usage: Some(token_usage),
     }
 }
 
@@ -570,58 +580,6 @@ fn map_completion_error(e: rig_core::completion::CompletionError) -> LlmError {
         CompletionError::RequestError(e) => LlmError::Transport(e.to_string()),
         CompletionError::ResponseError(s) => LlmError::Parse(s),
         CompletionError::ProviderError(s) => LlmError::Transport(s),
-    }
-}
-
-/// Adapt one rig streamed item into 0..2 greentic [`StreamEvent`]s.
-///
-/// A complete `ToolCall` expands to `ToolCallStart` + `ToolCallEnd` so the
-/// consumer always learns the tool name. `Final(_)` yields nothing — the
-/// terminal `Done` is appended by `chat_stream`'s wrapper. Generic over the
-/// provider streaming-response type `R` (only present in the dropped `Final`).
-fn streamed_to_events<R>(
-    item: rig_core::streaming::StreamedAssistantContent<R>,
-) -> Vec<StreamEvent> {
-    use rig_core::completion::message::ReasoningContent;
-    use rig_core::streaming::{StreamedAssistantContent as SAC, ToolCallDeltaContent};
-
-    match item {
-        SAC::Text(t) => vec![StreamEvent::TextChunk(t.text)],
-        SAC::ReasoningDelta { reasoning, .. } => vec![StreamEvent::ReasoningDelta { reasoning }],
-        SAC::Reasoning(r) => {
-            let text: String = r
-                .content
-                .into_iter()
-                .filter_map(|c| match c {
-                    ReasoningContent::Text { text, .. } => Some(text),
-                    ReasoningContent::Summary(s) => Some(s),
-                    // Encrypted/redacted reasoning blocks have no displayable text.
-                    _ => None,
-                })
-                .collect();
-            if text.is_empty() {
-                vec![]
-            } else {
-                vec![StreamEvent::ReasoningDelta { reasoning: text }]
-            }
-        }
-        SAC::ToolCall { tool_call, .. } => vec![
-            StreamEvent::ToolCallStart {
-                id: tool_call.id.clone(),
-                name: tool_call.function.name.clone(),
-            },
-            StreamEvent::ToolCallEnd {
-                id: tool_call.id,
-                args: tool_call.function.arguments,
-            },
-        ],
-        SAC::ToolCallDelta { id, content, .. } => match content {
-            ToolCallDeltaContent::Name(name) => vec![StreamEvent::ToolCallStart { id, name }],
-            ToolCallDeltaContent::Delta(args_delta) => {
-                vec![StreamEvent::ToolCallArgs { id, args_delta }]
-            }
-        },
-        SAC::Final(_) => vec![],
     }
 }
 
@@ -673,8 +631,8 @@ impl LlmProvider for RigBackend {
         // silently miss tool support.
         macro_rules! complete {
             ($client:expr) => {{
-                let model = $client.completion_model(self.model.as_str());
-                let response = model
+                let rig_model = $client.completion_model(self.model.as_str());
+                let response = rig_model
                     .completion(request)
                     .await
                     .map_err(map_completion_error)?;
@@ -682,6 +640,7 @@ impl LlmProvider for RigBackend {
                     response.choice,
                     response.usage,
                     requested_max_tokens,
+                    self.model.as_str(),
                 ))
             }};
         }
@@ -715,88 +674,11 @@ impl LlmProvider for RigBackend {
         }
     }
 
-    /// Stream a single completion as incremental [`StreamEvent`]s.
-    ///
-    /// Mirrors [`chat`](Self::chat)'s capability gate and per-provider dispatch,
-    /// but drives rig's `model.stream(request)`. Each rig streamed item is
-    /// adapted by [`streamed_to_events`] (0..2 events), provider errors are
-    /// mapped through [`map_completion_error`], and a terminal
-    /// `StreamEvent::Done { finish_reason: Stop }` is always appended.
-    ///
-    /// The returned [`ChatStream`] is `Send + 'static`; rig's provider streams
-    /// own the work (the client is cloned into the request), so boxing holds.
-    async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, LlmError> {
-        let caps = self.capabilities();
-        if !req.tools.is_empty() && !caps.tools {
-            return Err(LlmError::UnsupportedCapability("tools"));
-        }
-        if req.messages.iter().any(|m| !m.images.is_empty()) && !caps.vision {
-            return Err(LlmError::UnsupportedCapability("vision"));
-        }
-
-        let request = build_completion_request(req, self.kind)?;
-
-        // One identical streaming block per provider — see `chat()` for why the
-        // dispatch can't be a helper. NO wildcard arm: a new `Inner` variant
-        // must fail to compile rather than silently lose streaming. `request`
-        // moves into the single arm that runs, exactly like `complete!`.
-        macro_rules! stream {
-            ($client:expr) => {{
-                use futures_util::StreamExt;
-                let model = $client.completion_model(self.model.as_str());
-                let response = model.stream(request).await.map_err(map_completion_error)?;
-                let mapped = response.flat_map(|res| {
-                    let evs: Vec<Result<StreamEvent, LlmError>> = match res {
-                        Ok(item) => streamed_to_events(item).into_iter().map(Ok).collect(),
-                        Err(e) => vec![Err(map_completion_error(e))],
-                    };
-                    futures_util::stream::iter(evs)
-                });
-                // Always append a synthetic terminal `Done` so consumers have a
-                // clean end-of-stream marker. Contract: a preceding `Err` item
-                // means the turn FAILED — consumers must treat the first `Err`
-                // as terminal and ignore any trailing `Done`. `finish_reason`
-                // is a streaming placeholder (`Stop`); unlike non-streaming
-                // `chat()` (which derives Stop/ToolCalls/Length in
-                // `map_choice`), the streaming path does not surface a real
-                // finish reason — derive it from observed tool-call events if
-                // you need one.
-                let with_done = mapped.chain(futures_util::stream::once(async {
-                    Ok(StreamEvent::Done {
-                        finish_reason: FinishReason::Stop,
-                    })
-                }));
-                Ok(with_done.boxed())
-            }};
-        }
-
-        match &self.inner {
-            Inner::Openai(client) => stream!(client),
-            Inner::Anthropic(client) => stream!(client),
-            Inner::Deepseek(client) => stream!(client),
-            Inner::Gemini(client) => stream!(client),
-            Inner::Cohere(client) => stream!(client),
-            Inner::Ollama(client) => stream!(client),
-            Inner::Groq(client) => stream!(client),
-            Inner::Perplexity(client) => stream!(client),
-            Inner::Xai(client) => stream!(client),
-            Inner::Azure(client) => stream!(client),
-            Inner::AzureFoundry(client) => stream!(client),
-            Inner::Mistral(client) => stream!(client),
-            Inner::Openrouter(client) => stream!(client),
-            Inner::Huggingface(client) => stream!(client),
-            Inner::Together(client) => stream!(client),
-            Inner::Moonshot(client) => stream!(client),
-            Inner::Minimax(client) => stream!(client),
-            Inner::Hyperbolic(client) => stream!(client),
-            Inner::Galadriel(client) => stream!(client),
-            Inner::Mira(client) => stream!(client),
-            Inner::Zai(client) => stream!(client),
-            Inner::Xiaomimimo(client) => stream!(client),
-            Inner::Llamafile(client) => stream!(client),
-            #[cfg(feature = "bedrock")]
-            Inner::Bedrock(client) => stream!(client),
-        }
+    /// Streaming is not yet implemented by this backend.
+    /// Returns `LlmError::UnsupportedCapability("streaming")` unconditionally.
+    /// The canonical capability string checked by callers is `"streaming"`.
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream, LlmError> {
+        Err(LlmError::UnsupportedCapability("streaming"))
     }
 }
 
@@ -891,7 +773,12 @@ mod tests {
             ),
         ])
         .expect("non-empty");
-        let resp = map_choice(choice, rig_core::completion::Usage::new(), None);
+        let resp = map_choice(
+            choice,
+            rig_core::completion::Usage::new(),
+            None,
+            "test-model",
+        );
         assert_eq!(resp.content, "thinking");
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].id, "call_9");
@@ -911,14 +798,24 @@ mod tests {
             )
             .with_call_id("call_abc".into()),
         ));
-        let resp = map_choice(choice, rig_core::completion::Usage::new(), None);
+        let resp = map_choice(
+            choice,
+            rig_core::completion::Usage::new(),
+            None,
+            "test-model",
+        );
         assert_eq!(resp.tool_calls[0].id, "call_abc");
     }
 
     #[test]
     fn maps_text_only_choice_to_stop() {
         let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::text("hello"));
-        let resp = map_choice(choice, rig_core::completion::Usage::new(), None);
+        let resp = map_choice(
+            choice,
+            rig_core::completion::Usage::new(),
+            None,
+            "test-model",
+        );
         assert_eq!(resp.content, "hello");
         assert!(resp.tool_calls.is_empty());
         assert_eq!(resp.finish_reason, FinishReason::Stop);
@@ -930,7 +827,7 @@ mod tests {
             rig_core::OneOrMany::one(rig_core::message::AssistantContent::text("truncated…"));
         let mut usage = rig_core::completion::Usage::new();
         usage.output_tokens = 4096;
-        let resp = map_choice(choice, usage, Some(4096));
+        let resp = map_choice(choice, usage, Some(4096), "test-model");
         assert_eq!(resp.finish_reason, FinishReason::Length);
     }
 
@@ -939,14 +836,19 @@ mod tests {
         // rig's Usage contract: output_tokens == 0 means the provider did not
         // report usage — never infer truncation from it, even with a cap set.
         let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::text("hello"));
-        let resp = map_choice(choice, rig_core::completion::Usage::new(), Some(1));
+        let resp = map_choice(
+            choice,
+            rig_core::completion::Usage::new(),
+            Some(1),
+            "test-model",
+        );
         assert_eq!(resp.finish_reason, FinishReason::Stop);
 
         // Below-cap usage with a cap set is also a normal stop.
         let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::text("hello"));
         let mut usage = rig_core::completion::Usage::new();
         usage.output_tokens = 10;
-        let resp = map_choice(choice, usage, Some(4096));
+        let resp = map_choice(choice, usage, Some(4096), "test-model");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
     }
 
@@ -1345,82 +1247,5 @@ mod tests {
             ),
             "bedrock without the feature",
         );
-    }
-
-    #[test]
-    fn streamed_to_events_maps_text_reasoning_and_tool_deltas() {
-        use rig_core::completion::message::Text;
-        use rig_core::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
-
-        let evs = streamed_to_events::<()>(StreamedAssistantContent::Text(Text {
-            text: "hi".into(),
-            additional_params: None,
-        }));
-        assert!(matches!(evs.as_slice(), [StreamEvent::TextChunk(t)] if t == "hi"));
-
-        let evs = streamed_to_events::<()>(StreamedAssistantContent::ReasoningDelta {
-            id: None,
-            reasoning: "think".into(),
-        });
-        assert!(
-            matches!(evs.as_slice(), [StreamEvent::ReasoningDelta { reasoning }] if reasoning == "think")
-        );
-
-        let evs = streamed_to_events::<()>(StreamedAssistantContent::ToolCallDelta {
-            id: "c1".into(),
-            internal_call_id: "x".into(),
-            content: ToolCallDeltaContent::Name("emit_flow".into()),
-        });
-        assert!(
-            matches!(evs.as_slice(), [StreamEvent::ToolCallStart { id, name }] if id == "c1" && name == "emit_flow")
-        );
-
-        let evs = streamed_to_events::<()>(StreamedAssistantContent::ToolCallDelta {
-            id: "c1".into(),
-            internal_call_id: "x".into(),
-            content: ToolCallDeltaContent::Delta("{\"a\":1}".into()),
-        });
-        assert!(
-            matches!(evs.as_slice(), [StreamEvent::ToolCallArgs { id, args_delta }] if id == "c1" && args_delta == "{\"a\":1}")
-        );
-
-        let evs = streamed_to_events::<()>(StreamedAssistantContent::Final(()));
-        assert!(evs.is_empty());
-    }
-
-    /// Real-provider smoke test for streaming. Skipped unless `DEEPSEEK_API_KEY`
-    /// is present, so CI without a key is a no-op. Exercises the live
-    /// `model.stream()` path plus the `TextChunk`/`Done` mapping end to end.
-    #[tokio::test]
-    async fn deepseek_streams_text_when_key_present() {
-        use futures_util::StreamExt;
-        let Ok(key) = std::env::var("DEEPSEEK_API_KEY") else {
-            eprintln!("skipping: DEEPSEEK_API_KEY not set");
-            return;
-        };
-        let mut cred = dummy_cred();
-        cred.api_key = key;
-        let backend = RigBackend::new(ProviderKind::Deepseek, "deepseek-chat", &cred)
-            .expect("build deepseek backend");
-        let mut stream = backend
-            .chat_stream(ChatRequest {
-                messages: vec![ChatMessage::user("say hi in one word")],
-                tools: vec![],
-                tool_choice: None,
-                max_tokens: Some(16),
-                temperature: None,
-            })
-            .await
-            .expect("stream");
-        let mut saw_text = false;
-        let mut saw_done = false;
-        while let Some(ev) = stream.next().await {
-            match ev.expect("event") {
-                StreamEvent::TextChunk(_) => saw_text = true,
-                StreamEvent::Done { .. } => saw_done = true,
-                _ => {}
-            }
-        }
-        assert!(saw_text && saw_done);
     }
 }
