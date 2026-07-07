@@ -57,7 +57,7 @@ use rig_core::completion::CompletionModel;
 use super::capabilities::{Capabilities, ProviderKind};
 use super::credentials::Credential;
 use super::provider::{
-    ChatRequest, ChatResponse, ChatStream, FinishReason, LlmError, LlmProvider, MessageRole,
+    ChatRequest, ChatResponse, ChatStream, FinishReason, LlmError, LlmProvider, MessageRole, Usage,
 };
 
 /// Backend that dispatches `LlmProvider` calls to rig provider clients.
@@ -503,10 +503,15 @@ fn map_tool_choice(choice: Option<&str>) -> Option<rig_core::message::ToolChoice
 /// requested `max_tokens` cap, the response was cut off and the finish reason
 /// is [`FinishReason::Length`]. Providers that report no usage
 /// (`output_tokens == 0` per rig's `Usage` contract) never report `Length`.
+///
+/// `model` is the active model id; it is forwarded verbatim into
+/// [`Usage::model`] so callers can attribute cost without keeping a separate
+/// reference to the backend configuration.
 fn map_choice(
     choice: rig_core::OneOrMany<rig_core::message::AssistantContent>,
     usage: rig_core::completion::Usage,
     requested_max_tokens: Option<u64>,
+    model: &str,
 ) -> ChatResponse {
     use rig_core::message::AssistantContent;
     let mut content = String::new();
@@ -537,10 +542,16 @@ fn map_choice(
     } else {
         FinishReason::Stop
     };
+    let token_usage = Usage {
+        model: model.to_string(),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+    };
     ChatResponse {
         content,
         tool_calls,
         finish_reason,
+        usage: Some(token_usage),
     }
 }
 
@@ -620,8 +631,8 @@ impl LlmProvider for RigBackend {
         // silently miss tool support.
         macro_rules! complete {
             ($client:expr) => {{
-                let model = $client.completion_model(self.model.as_str());
-                let response = model
+                let rig_model = $client.completion_model(self.model.as_str());
+                let response = rig_model
                     .completion(request)
                     .await
                     .map_err(map_completion_error)?;
@@ -629,6 +640,7 @@ impl LlmProvider for RigBackend {
                     response.choice,
                     response.usage,
                     requested_max_tokens,
+                    self.model.as_str(),
                 ))
             }};
         }
@@ -761,7 +773,12 @@ mod tests {
             ),
         ])
         .expect("non-empty");
-        let resp = map_choice(choice, rig_core::completion::Usage::new(), None);
+        let resp = map_choice(
+            choice,
+            rig_core::completion::Usage::new(),
+            None,
+            "test-model",
+        );
         assert_eq!(resp.content, "thinking");
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].id, "call_9");
@@ -781,14 +798,24 @@ mod tests {
             )
             .with_call_id("call_abc".into()),
         ));
-        let resp = map_choice(choice, rig_core::completion::Usage::new(), None);
+        let resp = map_choice(
+            choice,
+            rig_core::completion::Usage::new(),
+            None,
+            "test-model",
+        );
         assert_eq!(resp.tool_calls[0].id, "call_abc");
     }
 
     #[test]
     fn maps_text_only_choice_to_stop() {
         let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::text("hello"));
-        let resp = map_choice(choice, rig_core::completion::Usage::new(), None);
+        let resp = map_choice(
+            choice,
+            rig_core::completion::Usage::new(),
+            None,
+            "test-model",
+        );
         assert_eq!(resp.content, "hello");
         assert!(resp.tool_calls.is_empty());
         assert_eq!(resp.finish_reason, FinishReason::Stop);
@@ -800,7 +827,7 @@ mod tests {
             rig_core::OneOrMany::one(rig_core::message::AssistantContent::text("truncated…"));
         let mut usage = rig_core::completion::Usage::new();
         usage.output_tokens = 4096;
-        let resp = map_choice(choice, usage, Some(4096));
+        let resp = map_choice(choice, usage, Some(4096), "test-model");
         assert_eq!(resp.finish_reason, FinishReason::Length);
     }
 
@@ -809,14 +836,19 @@ mod tests {
         // rig's Usage contract: output_tokens == 0 means the provider did not
         // report usage — never infer truncation from it, even with a cap set.
         let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::text("hello"));
-        let resp = map_choice(choice, rig_core::completion::Usage::new(), Some(1));
+        let resp = map_choice(
+            choice,
+            rig_core::completion::Usage::new(),
+            Some(1),
+            "test-model",
+        );
         assert_eq!(resp.finish_reason, FinishReason::Stop);
 
         // Below-cap usage with a cap set is also a normal stop.
         let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::text("hello"));
         let mut usage = rig_core::completion::Usage::new();
         usage.output_tokens = 10;
-        let resp = map_choice(choice, usage, Some(4096));
+        let resp = map_choice(choice, usage, Some(4096), "test-model");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
     }
 

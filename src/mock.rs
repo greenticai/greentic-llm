@@ -151,6 +151,7 @@ impl LlmProvider for TestLlmProvider {
             content: self.response_text.clone(),
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,
+            usage: None,
         })
     }
 
@@ -213,11 +214,13 @@ mod tests {
                     arguments: serde_json::json!({"name": "first"}),
                 }],
                 finish_reason: FinishReason::ToolCalls,
+                usage: None,
             })
             .script_response(ChatResponse {
                 content: "second".into(),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
+                usage: None,
             })
             .build();
 

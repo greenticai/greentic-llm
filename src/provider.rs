@@ -149,12 +149,27 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Token usage for one completion, normalized across providers.
+///
+/// Token counts default to `0` when a provider does not report usage; the
+/// rig backend maps every provider into this shape. `model` is the active
+/// model id that served the request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// One-shot chat response.
 #[derive(Clone, Debug)]
 pub struct ChatResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
+    /// Token usage for this completion. `None` when the backend cannot report
+    /// it (e.g. legacy/streaming paths); the rig backend populates it.
+    pub usage: Option<Usage>,
 }
 
 /// Why the provider stopped generating tokens.
@@ -229,6 +244,37 @@ pub trait LlmProvider: Send + Sync {
 
     /// Streaming completion. Used by `/api/agent/stream`.
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, LlmError>;
+}
+
+#[cfg(test)]
+mod usage_field_tests {
+    use super::*;
+
+    #[test]
+    fn chat_response_holds_usage() {
+        let r = ChatResponse {
+            content: "hi".into(),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: Some(Usage {
+                model: "gpt-4o".into(),
+                input_tokens: 12,
+                output_tokens: 8,
+            }),
+        };
+        let u = r.usage.as_ref().expect("usage present");
+        assert_eq!(u.input_tokens, 12);
+        assert_eq!(u.output_tokens, 8);
+        assert_eq!(u.model, "gpt-4o");
+    }
+
+    #[test]
+    fn usage_defaults_to_zero() {
+        let u = Usage::default();
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.output_tokens, 0);
+        assert!(u.model.is_empty());
+    }
 }
 
 #[cfg(test)]
