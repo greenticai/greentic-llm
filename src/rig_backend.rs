@@ -1007,8 +1007,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_tools_when_capability_says_no() {
-        // Ollama advertises tools = false.
-        let b = RigBackend::new(ProviderKind::Ollama, "llama3.2", &dummy_cred()).expect("build");
+        // Llamafile advertises tools = false. This was Ollama until Ollama's
+        // declaration was corrected — the subject changed, the mechanism being
+        // pinned did not: a request carrying tools must be refused HERE, on
+        // the matrix, before any provider call is built.
+        let b =
+            RigBackend::new(ProviderKind::Llamafile, "any-model", &dummy_cred()).expect("build");
         let req = ChatRequest {
             messages: vec![ChatMessage::user("hi")],
             tools: vec![ToolDef {
@@ -1022,6 +1026,55 @@ mod tests {
         };
         let err = b.chat(req).await.expect_err("must reject");
         assert!(matches!(err, LlmError::UnsupportedCapability("tools")));
+    }
+
+    /// End-to-end proof that lifting Ollama's `tools` flag exposes real tool
+    /// calling rather than a differently-shaped failure — the flag alone only
+    /// proves the guard stopped firing.
+    ///
+    /// `#[ignore]`d: it needs a local Ollama serving a tool-capable model. Run
+    /// it with a daemon on 11434 and llama3.2 pulled:
+    ///
+    /// ```text
+    /// cargo test --lib rig_backend::tests::ollama_really_calls_a_tool -- --ignored --nocapture
+    /// ```
+    ///
+    /// Note the base URL carries no `/v1`: this backend appends its own path,
+    /// and a doubled prefix 404s.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "needs a local Ollama daemon with a tool-capable model"]
+    async fn ollama_really_calls_a_tool() {
+        let cred = Credential {
+            api_key: String::new(),
+            base_url: Some("http://127.0.0.1:11434".to_string()),
+            expires_at: None,
+            api_version: None,
+            aws_profile: None,
+        };
+        let b = RigBackend::new(ProviderKind::Ollama, "llama3.2:latest", &cred).expect("build");
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user(
+                "What is the weather in Jakarta? Use the tool.",
+            )],
+            tools: vec![ToolDef {
+                name: "get_weather".into(),
+                description: "Get the current weather for a city".into(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"]
+                }),
+            }],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let res = b.chat(req).await.expect("ollama answers");
+        assert_eq!(res.finish_reason, FinishReason::ToolCalls, "{res:?}");
+        assert_eq!(
+            res.tool_calls.first().map(|c| c.name.as_str()),
+            Some("get_weather")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
