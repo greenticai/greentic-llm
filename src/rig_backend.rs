@@ -386,6 +386,10 @@ fn build_completion_request(
         AssistantContent, ImageMediaType, Message, MimeType, ToolResultContent, UserContent,
     };
 
+    // Resolve tool_choice first: a choice the provider cannot express fails
+    // here, before any message conversion or network call.
+    let (tools, tool_choice) = resolve_tool_choice(kind, req.tools, req.tool_choice.as_deref())?;
+
     // Build the preamble while the messages are still borrowable; the loop
     // below consumes them.
     let preamble = build_preamble(&req.messages);
@@ -460,8 +464,7 @@ fn build_completion_request(
         preamble,
         chat_history,
         documents: vec![],
-        tools: req
-            .tools
+        tools: tools
             .into_iter()
             .map(|t| rig_core::completion::ToolDefinition {
                 name: t.name,
@@ -471,10 +474,74 @@ fn build_completion_request(
             .collect(),
         temperature: req.temperature.map(f64::from),
         max_tokens,
-        tool_choice: map_tool_choice(req.tool_choice.as_deref()),
+        tool_choice,
         additional_params: None,
         output_schema: None,
     })
+}
+
+/// Resolve the caller's `tool_choice` against what the provider's wire
+/// protocol can express. Returns the tools to advertise and the rig
+/// `ToolChoice` to forward.
+///
+/// Every provider except Ollama forwards the choice unchanged through
+/// [`map_tool_choice`] and rig's provider-specific encoding.
+///
+/// Ollama has no `tool_choice` on the wire, so the forward path would drop it:
+///
+/// - rig 0.38.2's `ollama::OllamaCompletionRequest` has no such field. Its
+///   `TryFrom` logs `` `tool_choice` not supported for Ollama `` and discards
+///   the value (`providers/ollama.rs:447`). Any other `additional_params` key
+///   is merged into `options`, not the top level, so it can't be smuggled
+///   through there either.
+/// - Ollama's own `api.ChatRequest` (native `/api/chat`, which rig targets)
+///   and `openai.ChatCompletionRequest` (its `/v1` compatibility shim) have
+///   no `tool_choice` field either. Checked at ollama `4f6f739`. Go's JSON
+///   decoder drops unknown keys, so sending the field would not fail; it
+///   would just be ignored.
+///
+/// Ollama always behaves like `auto`: when `tools` is present the model may
+/// call one or answer in text. Given that, Ollama handles each choice as
+/// follows:
+///
+/// | `tool_choice`      | Ollama behaviour                                  |
+/// |--------------------|---------------------------------------------------|
+/// | absent / `"auto"`  | tools sent unchanged. Ollama's only mode, so this matches exactly. |
+/// | `"none"`           | tools are **not sent**, so the model cannot call one. |
+/// | `"required"`       | refused: `UnsupportedCapability`                  |
+/// | a function name    | refused: `UnsupportedCapability`                  |
+///
+/// The last two are refused rather than degraded. A caller asking to force a
+/// call expects its next step to receive one; quietly sending a plain `auto`
+/// request would let the model answer in text and break that step
+/// downstream, far from the cause. To steer Ollama toward one function, send
+/// only that function in `tools`.
+///
+/// For `"auto"` rig receives `None` rather than `ToolChoice::Auto`, so it no
+/// longer logs a "not supported" warning for a choice that is honoured.
+#[allow(clippy::type_complexity)]
+fn resolve_tool_choice(
+    kind: ProviderKind,
+    tools: Vec<super::provider::ToolDef>,
+    choice: Option<&str>,
+) -> Result<
+    (
+        Vec<super::provider::ToolDef>,
+        Option<rig_core::message::ToolChoice>,
+    ),
+    LlmError,
+> {
+    if kind != ProviderKind::Ollama {
+        return Ok((tools, map_tool_choice(choice)));
+    }
+    match choice {
+        None | Some("auto") => Ok((tools, None)),
+        Some("none") => Ok((Vec::new(), None)),
+        Some("required") => Err(LlmError::UnsupportedCapability("tool_choice=required")),
+        Some(_) => Err(LlmError::UnsupportedCapability(
+            "tool_choice=<named function>",
+        )),
+    }
 }
 
 /// Map the greentic `tool_choice` string convention (`"auto"` / `"none"` /
@@ -1007,8 +1074,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_tools_when_capability_says_no() {
-        // Ollama advertises tools = false.
-        let b = RigBackend::new(ProviderKind::Ollama, "llama3.2", &dummy_cred()).expect("build");
+        // Llamafile advertises tools = false. This was Ollama until Ollama's
+        // declaration was corrected — the subject changed, the mechanism being
+        // pinned did not: a request carrying tools must be refused HERE, on
+        // the matrix, before any provider call is built.
+        let b =
+            RigBackend::new(ProviderKind::Llamafile, "any-model", &dummy_cred()).expect("build");
         let req = ChatRequest {
             messages: vec![ChatMessage::user("hi")],
             tools: vec![ToolDef {
@@ -1022,6 +1093,55 @@ mod tests {
         };
         let err = b.chat(req).await.expect_err("must reject");
         assert!(matches!(err, LlmError::UnsupportedCapability("tools")));
+    }
+
+    /// End-to-end proof that lifting Ollama's `tools` flag exposes real tool
+    /// calling rather than a differently-shaped failure — the flag alone only
+    /// proves the guard stopped firing.
+    ///
+    /// `#[ignore]`d: it needs a local Ollama serving a tool-capable model. Run
+    /// it with a daemon on 11434 and llama3.2 pulled:
+    ///
+    /// ```text
+    /// cargo test --lib rig_backend::tests::ollama_really_calls_a_tool -- --ignored --nocapture
+    /// ```
+    ///
+    /// Note the base URL carries no `/v1`: this backend appends its own path,
+    /// and a doubled prefix 404s.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "needs a local Ollama daemon with a tool-capable model"]
+    async fn ollama_really_calls_a_tool() {
+        let cred = Credential {
+            api_key: String::new(),
+            base_url: Some("http://127.0.0.1:11434".to_string()),
+            expires_at: None,
+            api_version: None,
+            aws_profile: None,
+        };
+        let b = RigBackend::new(ProviderKind::Ollama, "llama3.2:latest", &cred).expect("build");
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user(
+                "What is the weather in Jakarta? Use the tool.",
+            )],
+            tools: vec![ToolDef {
+                name: "get_weather".into(),
+                description: "Get the current weather for a city".into(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"]
+                }),
+            }],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let res = b.chat(req).await.expect("ollama answers");
+        assert_eq!(res.finish_reason, FinishReason::ToolCalls, "{res:?}");
+        assert_eq!(
+            res.tool_calls.first().map(|c| c.name.as_str()),
+            Some("get_weather")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1042,6 +1162,203 @@ mod tests {
         };
         let err = b.chat(req).await.expect_err("must reject");
         assert!(matches!(err, LlmError::UnsupportedCapability("vision")));
+    }
+
+    fn tool_request_with_choice(choice: Option<&str>) -> ChatRequest {
+        let mut req = tool_request();
+        req.tool_choice = choice.map(str::to_string);
+        req
+    }
+
+    #[test]
+    fn ollama_auto_or_absent_keeps_tools_and_forwards_no_choice() {
+        for choice in [None, Some("auto")] {
+            let r =
+                build_completion_request(tool_request_with_choice(choice), ProviderKind::Ollama)
+                    .expect("convert");
+            assert_eq!(r.tools.len(), 1, "{choice:?}: tools must be advertised");
+            // `None`, not `ToolChoice::Auto`: rig would log a false
+            // "not supported" warning for a choice that is honoured.
+            assert!(r.tool_choice.is_none(), "{choice:?}");
+        }
+    }
+
+    #[test]
+    fn ollama_none_withholds_the_tools() {
+        let r =
+            build_completion_request(tool_request_with_choice(Some("none")), ProviderKind::Ollama)
+                .expect("convert");
+        assert!(r.tools.is_empty(), "a model with no tools cannot call one");
+        assert!(r.tool_choice.is_none());
+        // History, tool calls and tool results included, is untouched.
+        assert_eq!(r.chat_history.len(), 3);
+    }
+
+    #[test]
+    fn ollama_refuses_choices_it_cannot_express() {
+        let cases = [
+            ("required", "tool_choice=required"),
+            ("lookup", "tool_choice=<named function>"),
+        ];
+        for (choice, capability) in cases {
+            let err = build_completion_request(
+                tool_request_with_choice(Some(choice)),
+                ProviderKind::Ollama,
+            )
+            .expect_err("must refuse rather than send an un-forced request");
+            match err {
+                LlmError::UnsupportedCapability(c) => assert_eq!(c, capability, "{choice}"),
+                other => panic!("{choice}: unexpected error {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn non_ollama_providers_forward_tool_choice_unchanged() {
+        // The Ollama handling must not leak into providers whose protocol
+        // encodes the field.
+        for kind in [ProviderKind::Openai, ProviderKind::Llamafile] {
+            let r = build_completion_request(tool_request_with_choice(Some("none")), kind)
+                .expect("convert");
+            assert_eq!(r.tools.len(), 1, "{kind:?}");
+            assert!(matches!(
+                r.tool_choice,
+                Some(rig_core::message::ToolChoice::None)
+            ));
+            let r = build_completion_request(tool_request_with_choice(Some("required")), kind)
+                .expect("convert");
+            assert!(matches!(
+                r.tool_choice,
+                Some(rig_core::message::ToolChoice::Required)
+            ));
+        }
+    }
+
+    /// Serve exactly one HTTP request on a loopback port with a canned Ollama
+    /// `/api/chat` reply, and hand back the request path and JSON body.
+    ///
+    /// These assertions are about the body rig puts on the wire. The
+    /// `CompletionRequest` is only an intermediate form, and rig's Ollama
+    /// encoding is where the field used to disappear.
+    fn one_shot_ollama() -> (String, std::thread::JoinHandle<(String, serde_json::Value)>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut chunk).expect("read");
+                assert!(n > 0, "connection closed before headers completed");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let content_length = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .expect("request carries a Content-Length");
+            while buf.len() < header_end + content_length {
+                let n = stream.read(&mut chunk).expect("read body");
+                assert!(n > 0, "connection closed before body completed");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let path = head
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_string();
+            let body: serde_json::Value =
+                serde_json::from_slice(&buf[header_end..header_end + content_length])
+                    .expect("request body is JSON");
+
+            let reply = serde_json::json!({
+                "model": "m",
+                "created_at": "2026-09-18T00:00:00Z",
+                "message": { "role": "assistant", "content": "ok" },
+                "done": true,
+                "done_reason": "stop"
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            stream.write_all(response.as_bytes()).expect("write reply");
+            (path, body)
+        });
+        (base, handle)
+    }
+
+    async fn ollama_wire_body(choice: Option<&str>) -> (String, serde_json::Value) {
+        let (base, server) = one_shot_ollama();
+        let cred = Credential {
+            api_key: String::new(),
+            base_url: Some(base),
+            expires_at: None,
+            api_version: None,
+            aws_profile: None,
+        };
+        let b = RigBackend::new(ProviderKind::Ollama, "m", &cred).expect("build");
+        let res = b
+            .chat(tool_request_with_choice(choice))
+            .await
+            .expect("chat against the loopback server");
+        assert_eq!(res.content, "ok");
+        server.join().expect("server thread")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ollama_wire_auto_sends_tools_and_no_tool_choice_key() {
+        let (path, body) = ollama_wire_body(Some("auto")).await;
+        assert_eq!(path, "/api/chat", "rig targets Ollama's native endpoint");
+        let tools = body["tools"].as_array().expect("tools on the wire");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "lookup");
+        // Ollama has no such field; its absence is the correct encoding.
+        assert!(body.get("tool_choice").is_none(), "{body}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ollama_wire_none_sends_no_tools() {
+        let (path, body) = ollama_wire_body(Some("none")).await;
+        assert_eq!(path, "/api/chat");
+        assert!(
+            body.get("tools").is_none(),
+            "tools must be withheld: {body}"
+        );
+        assert!(body.get("tool_choice").is_none(), "{body}");
+        // The conversation, earlier tool turns included, still goes out.
+        assert!(
+            body["messages"].as_array().is_some_and(|m| m.len() >= 3),
+            "{body}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ollama_required_fails_before_any_request_is_sent() {
+        // `dummy_cred()` leaves the default localhost:11434. Whether or not a
+        // daemon listens there, reaching the transport would yield a
+        // Transport/Status error or a response, never this refusal.
+        let b = RigBackend::new(ProviderKind::Ollama, "m", &dummy_cred()).expect("build");
+        let err = b
+            .chat(tool_request_with_choice(Some("required")))
+            .await
+            .expect_err("must refuse");
+        assert!(matches!(
+            err,
+            LlmError::UnsupportedCapability("tool_choice=required")
+        ));
     }
 
     #[test]

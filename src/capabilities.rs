@@ -187,10 +187,22 @@ impl clap::ValueEnum for ProviderKind {
 impl From<ProviderKind> for Capabilities {
     /// Maps each provider to its declared feature surface.
     ///
-    /// Ollama and xAI use conservative defaults (`tools: false` / `vision:
-    /// false`) because those features are model-dependent in practice;
-    /// per-model capability detection is a follow-up tracked after the
-    /// rig migration completes.
+    /// xAI and Llamafile use conservative defaults (`tools: false` /
+    /// `vision: false`) because those features are model-dependent in
+    /// practice; per-model capability detection is a follow-up tracked after
+    /// the rig migration completes.
+    ///
+    /// Ollama was in that list and is not any more. The conservative default
+    /// is only conservative when the cost of being wrong is symmetric, and
+    /// here it was not: this matrix is consulted by `RigBackend::chat` BEFORE
+    /// a request is built, so `tools: false` did not degrade a tool-calling
+    /// request — it refused one, for every model, with a message naming the
+    /// provider rather than the model. Ollama's `/api/chat` accepts a `tools`
+    /// array and answers with `message.tool_calls`, and `rig-core`'s
+    /// `providers::ollama` serializes and parses both, so the declaration was
+    /// describing a limitation that did not exist. A model that genuinely
+    /// cannot call tools is now refused by Ollama itself, in a message that
+    /// names the model — which is the fact the caller needs.
     fn from(kind: ProviderKind) -> Self {
         match kind {
             ProviderKind::Openai => Capabilities {
@@ -230,8 +242,10 @@ impl From<ProviderKind> for Capabilities {
             },
             ProviderKind::Ollama => Capabilities {
                 chat: true,
-                tools: false,
+                tools: true,
                 streaming: true,
+                // Left conservative: vision is genuinely per-model here and,
+                // unlike tools, nothing downstream is blocked outright by it.
                 vision: false,
                 system_prompt: true,
             },
@@ -415,6 +429,32 @@ mod tests {
             .map(|k| k.as_str())
             .collect();
         assert_eq!(keyless, ["ollama", "bedrock", "llamafile"]);
+    }
+
+    /// Ollama's own `/api/chat` takes a `tools` array and answers with
+    /// `message.tool_calls`, and the rig backend this crate dispatches through
+    /// serializes and parses both (`rig-core`'s `providers::ollama`). Declaring
+    /// `tools: false` therefore refused a request the transport could carry:
+    /// `RigBackend::chat` rejects up front on the capability matrix, before a
+    /// request is ever built, so no Ollama model could be used for tool
+    /// calling regardless of whether it supported it.
+    ///
+    /// It cost a downstream operator three model swaps to work out that the
+    /// model was never consulted — the refusal names "this provider", and the
+    /// model is the part they can see. A model that genuinely cannot call
+    /// tools now fails with Ollama's own message, which names the model.
+    #[test]
+    fn ollama_can_call_tools() {
+        assert!(Capabilities::from(ProviderKind::Ollama).tools);
+    }
+
+    /// Llamafile is the same shape of thing — a local OpenAI-compatible daemon
+    /// — and is deliberately NOT changed here: unlike Ollama, nothing has been
+    /// verified against it, and a capability declared without evidence is what
+    /// this change is undoing.
+    #[test]
+    fn the_conservative_default_is_lifted_only_where_it_was_verified() {
+        assert!(!Capabilities::from(ProviderKind::Llamafile).tools);
     }
 
     #[test]

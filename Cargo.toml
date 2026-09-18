@@ -1,6 +1,6 @@
 [package]
 name = "greentic-llm"
-version = "1.2.0-dev.0"
+version = "1.3.1-research.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -18,7 +18,7 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 clap = { version = "4.5", optional = true }
 futures-util = "0.3"
-rig-core = "0.38"
+rig-core = { version = "0.38", optional = true }
 rig-bedrock = { version = "0.38", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,7 +30,8 @@ http = "1"
 tokio = { version = "1", features = ["rt", "macros"] }
 
 [features]
-default = []
-bedrock = ["dep:rig-bedrock"]
+default = ["rig"]
+bedrock = ["rig", "dep:rig-bedrock"]
 clap = ["dep:clap"]
+rig = ["dep:rig-core"]
 test-mock = []
