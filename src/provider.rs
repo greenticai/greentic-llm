@@ -136,6 +136,12 @@ pub struct ChatRequest {
     pub tools: Vec<ToolDef>,
     /// Optional tool selection hint. Conventionally `"auto"`, `"required"`,
     /// `"none"`, or a specific tool name; provider-specific semantics apply.
+    ///
+    /// Ollama's API has no `tool_choice` field. The rig backend honours
+    /// `"auto"` (Ollama's only mode) and `"none"` (tools are not sent), and
+    /// returns [`LlmError::UnsupportedCapability`] for `"required"` or a named
+    /// function instead of silently sending an un-forced request. See
+    /// `rig_backend::resolve_tool_choice`.
     pub tool_choice: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
