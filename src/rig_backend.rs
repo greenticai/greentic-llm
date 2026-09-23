@@ -11,7 +11,8 @@
 //! `ChatMessage::tool_result` per call, and invoke `chat()` again.
 //! `chat_stream()` drives rig's `CompletionModel::stream` over the same
 //! converted request, adapting rig's chunks into `StreamEvent`s and closing
-//! with `Usage` (only when the provider reported it) then `Done`.
+//! with `Usage` — emitted unless the provider's whole token reading is zero,
+//! which is rig's signal that it supplied no usage at all — then `Done`.
 //!
 //! Architectural note — tools are dynamic
 //! ---------------------------------------
@@ -626,14 +627,40 @@ fn map_choice(
 }
 
 /// Map rig's end-of-stream usage onto a [`StreamEvent::Usage`], or `None` when
-/// the provider did not report it.
+/// the whole reading is zero.
 ///
 /// rig's shared openai-compatible driver ends with `unwrap_or_default()`, so a
-/// non-reporting provider yields zeros rather than an absence. This applies the
-/// same `output_tokens == 0` convention [`map_choice`] uses for truncation, so
-/// the crate has ONE rule for "the provider said nothing", not two.
+/// non-reporting provider yields a zeroed `Usage` rather than an absence. rig's
+/// own contract names the WHOLE reading, not the output counter: "If tokens
+/// used are `0`, then the provider failed to supply token usage metrics"
+/// (`rig_core::completion::Usage`). So the test here is `input_tokens == 0 &&
+/// output_tokens == 0`.
+///
+/// **A zero `output_tokens` beside a non-zero `input_tokens` is a real
+/// reading and is billed.** `unwrap_or_default()` cannot produce it: a non-zero
+/// input count proves the provider sent a usage block. It is the normal shape
+/// of a turn that consumed a prompt and emitted nothing — a Gemini candidate
+/// blocked by a safety filter (`promptTokenCount` with no
+/// `candidatesTokenCount`), an immediate stop sequence, a refusal. The provider
+/// charges for those input tokens, so suppressing the event would lose the
+/// charge silently.
+///
+/// The reading is deliberately NOT compared against `Usage::default()`: that
+/// would admit a `total_tokens`-only reading and emit a meter event carrying
+/// `{0, 0}`, which is worse than emitting nothing — an absence can be noticed,
+/// a zeroed charge cannot.
+///
+/// This is the same interpretation of zeros [`map_choice`] applies when it
+/// declines to infer [`FinishReason::Length`], but the two paths ACT on it
+/// differently and a meter author needs to know which one they are reading:
+/// `map_choice` fills `ChatResponse::usage` unconditionally, zeros included, so
+/// a non-reporting provider yields `Some(Usage { input_tokens: 0,
+/// output_tokens: 0, .. })` from `chat()` and NO `StreamEvent::Usage` at all
+/// from `chat_stream()`. One rule for interpreting zeros, two behaviours for
+/// acting on them. Reconciling them would change `chat()` for every existing
+/// caller, so it is recorded here rather than done in passing.
 fn stream_usage_event(reported: rig_core::completion::Usage, model: &str) -> Option<StreamEvent> {
-    if reported.output_tokens == 0 {
+    if reported.input_tokens == 0 && reported.output_tokens == 0 {
         return None;
     }
     Some(StreamEvent::Usage(Usage {
@@ -645,9 +672,10 @@ fn stream_usage_event(reported: rig_core::completion::Usage, model: &str) -> Opt
 
 /// Adapt a rig streaming response into our [`ChatStream`].
 ///
-/// The terminator order is a contract: `Usage` (when the provider reported it)
-/// is emitted BEFORE `Done`, so a consumer that stops reading at `Done` has
-/// already seen the usage.
+/// The terminator order is a contract: `Usage` — emitted unless the provider's
+/// whole token reading is zero, see [`stream_usage_event`] — comes BEFORE
+/// `Done`, so a consumer that stops reading at `Done` has already seen the
+/// usage.
 ///
 /// A tool call arrives from rig complete — `StreamedAssistantContent::ToolCall`
 /// is only yielded once rig has assembled the whole call — so one call becomes
@@ -835,8 +863,9 @@ impl LlmProvider for RigBackend {
     /// Same capability gate as [`LlmProvider::chat`]: requests carrying tools
     /// or images are rejected up front when the provider's matrix does not
     /// advertise the feature. The returned stream terminates with
-    /// [`StreamEvent::Usage`] (only when the provider reported usage) followed
-    /// by [`StreamEvent::Done`]; a provider error mid-stream is yielded as a
+    /// [`StreamEvent::Usage`] — emitted unless the provider's whole token
+    /// reading is zero, see [`stream_usage_event`] — followed by
+    /// [`StreamEvent::Done`]; a provider error mid-stream is yielded as a
     /// single `Err` item and ends the stream, so no `Done` follows it.
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, LlmError> {
         let caps = self.capabilities();
@@ -1089,6 +1118,256 @@ mod tests {
             }
             other => panic!("expected a Usage event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_prompt_only_usage_reading_is_still_billed() {
+        // `unwrap_or_default()` cannot produce a non-zero input count, so this
+        // IS a provider reading: a prompt was consumed and nothing was emitted
+        // (safety-filtered candidate, immediate stop sequence, refusal). The
+        // provider charges for those input tokens.
+        let mut reported = rig_core::completion::Usage::new();
+        reported.input_tokens = 12;
+        reported.output_tokens = 0;
+        let event = stream_usage_event(reported, "test-model").expect("usage reported");
+        match event {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.model, "test-model");
+                assert_eq!(u.input_tokens, 12);
+                assert_eq!(u.output_tokens, 0);
+            }
+            other => panic!("expected a Usage event, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // `map_rig_stream` — driven offline against rig's own public stream
+    // constructor. `StreamingCompletionResponse::stream` takes a
+    // `StreamingResult<R>`, and `RawStreamingChoice` / `RawStreamingToolCall`
+    // are public with public fields, so a provider stream can be faked
+    // exactly as rig's own drivers emit one — no network, no credential.
+    // ------------------------------------------------------------------
+
+    /// A final-response payload that reports usage. rig ships
+    /// `impl GetTokenUsage for ()` (a stream that reports nothing) but no impl
+    /// for `Usage` itself, so the reporting case needs a local carrier.
+    #[derive(Clone)]
+    struct ReportsUsage(rig_core::completion::Usage);
+
+    impl rig_core::completion::GetTokenUsage for ReportsUsage {
+        fn token_usage(&self) -> Option<rig_core::completion::Usage> {
+            Some(self.0)
+        }
+    }
+
+    fn rig_stream_of<R>(
+        items: Vec<
+            Result<
+                rig_core::streaming::RawStreamingChoice<R>,
+                rig_core::completion::CompletionError,
+            >,
+        >,
+    ) -> rig_core::streaming::StreamingCompletionResponse<R>
+    where
+        R: Clone + Unpin + rig_core::completion::GetTokenUsage + Send + 'static,
+    {
+        rig_core::streaming::StreamingCompletionResponse::stream(Box::pin(
+            futures_util::stream::iter(items),
+        ))
+    }
+
+    async fn drain(stream: ChatStream) -> Vec<Result<StreamEvent, LlmError>> {
+        use futures_util::StreamExt;
+        stream.collect().await
+    }
+
+    fn raw_tool_call(
+        id: &str,
+        call_id: Option<&str>,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> rig_core::streaming::RawStreamingToolCall {
+        let mut tc = rig_core::streaming::RawStreamingToolCall::empty();
+        tc.id = id.to_string();
+        tc.call_id = call_id.map(str::to_string);
+        tc.name = name.to_string();
+        tc.arguments = arguments;
+        tc
+    }
+
+    /// Position of the first event matching `pred`, or `None`.
+    fn position_of(
+        events: &[Result<StreamEvent, LlmError>],
+        pred: impl Fn(&StreamEvent) -> bool,
+    ) -> Option<usize> {
+        events.iter().position(|e| matches!(e, Ok(ev) if pred(ev)))
+    }
+
+    #[tokio::test]
+    async fn a_stream_ends_with_usage_then_done_in_that_order() {
+        // The load-bearing ordering assertion. An SSE handler returns at
+        // `Done`, so a `Usage` emitted after it is never read and the call is
+        // never billed — silently. Asserting "contains a Usage" would pass in
+        // that broken world; asserting the POSITIONS is what catches it.
+        use rig_core::streaming::RawStreamingChoice;
+        let mut reported = rig_core::completion::Usage::new();
+        reported.input_tokens = 12;
+        reported.output_tokens = 5;
+        let rig_stream = rig_stream_of(vec![
+            Ok(RawStreamingChoice::Message("Hel".into())),
+            Ok(RawStreamingChoice::Message("lo".into())),
+            Ok(RawStreamingChoice::FinalResponse(ReportsUsage(reported))),
+        ]);
+
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string())).await;
+
+        let text: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::TextChunk(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, vec!["Hel".to_string(), "lo".to_string()]);
+
+        let usage_at = position_of(&events, |e| matches!(e, StreamEvent::Usage(_)))
+            .expect("a reported usage must produce a Usage event");
+        let done_at = position_of(&events, |e| matches!(e, StreamEvent::Done { .. }))
+            .expect("a clean stream must terminate with Done");
+        assert!(
+            usage_at < done_at,
+            "Usage must precede Done: usage at {usage_at}, done at {done_at}"
+        );
+        assert_eq!(
+            done_at,
+            events.len() - 1,
+            "Done must be the last event; nothing may follow it"
+        );
+
+        match &events[usage_at] {
+            Ok(StreamEvent::Usage(u)) => {
+                assert_eq!(u.model, "test-model");
+                assert_eq!(u.input_tokens, 12);
+                assert_eq!(u.output_tokens, 5);
+            }
+            other => panic!("expected a Usage event, got {other:?}"),
+        }
+        assert!(matches!(
+            &events[done_at],
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::Stop
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_yields_one_err_and_no_done() {
+        use rig_core::streaming::RawStreamingChoice;
+        // Not the word "aborted": rig's own `poll_next` treats a
+        // ProviderError containing it as ordinary cancellation and swallows
+        // it, so such a stream would never reach our error arm at all.
+        let rig_stream = rig_stream_of::<()>(vec![
+            Ok(RawStreamingChoice::Message("partial".into())),
+            Err(rig_core::completion::CompletionError::ProviderError(
+                "boom".into(),
+            )),
+            Ok(RawStreamingChoice::Message("never read".into())),
+        ]);
+
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string())).await;
+
+        assert_eq!(events.len(), 2, "text chunk then the error, nothing else");
+        assert!(matches!(&events[0], Ok(StreamEvent::TextChunk(t)) if t == "partial"));
+        assert!(matches!(&events[1], Err(LlmError::Transport(m)) if m == "boom"));
+        assert!(
+            position_of(&events, |e| matches!(e, StreamEvent::Done { .. })).is_none(),
+            "an errored stream must not also claim a clean Done"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_call_prefers_call_id_over_id() {
+        // Twin of `maps_choice_prefers_call_id_when_present`: the id a caller
+        // echoes back must not depend on whether the turn was streamed.
+        use rig_core::streaming::RawStreamingChoice;
+        let rig_stream =
+            rig_stream_of::<()>(vec![Ok(RawStreamingChoice::ToolCall(raw_tool_call(
+                "id_raw",
+                Some("call_9"),
+                "lookup",
+                serde_json::json!({"q": "x"}),
+            )))]);
+
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string())).await;
+
+        match &events[0] {
+            Ok(StreamEvent::ToolCallStart { id, name }) => {
+                assert_eq!(id, "call_9");
+                assert_eq!(name, "lookup");
+            }
+            other => panic!("expected ToolCallStart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_call_bookends_one_id_and_sets_the_finish_reason() {
+        use rig_core::streaming::RawStreamingChoice;
+        let rig_stream = rig_stream_of::<()>(vec![Ok(RawStreamingChoice::ToolCall(
+            raw_tool_call("call_1", None, "lookup", serde_json::json!({"q": "x"})),
+        ))]);
+
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string())).await;
+
+        assert_eq!(events.len(), 3, "start, end, done");
+        let start_id = match &events[0] {
+            Ok(StreamEvent::ToolCallStart { id, name }) => {
+                assert_eq!(name, "lookup");
+                id.clone()
+            }
+            other => panic!("expected ToolCallStart, got {other:?}"),
+        };
+        match &events[1] {
+            Ok(StreamEvent::ToolCallEnd { id, args }) => {
+                assert_eq!(
+                    id, &start_id,
+                    "start and end must name the same call, or the caller \
+                     cannot correlate the result"
+                );
+                assert_eq!(args, &serde_json::json!({"q": "x"}));
+            }
+            other => panic!("expected ToolCallEnd, got {other:?}"),
+        }
+        assert_eq!(start_id, "call_1", "no call_id, so the provider id is used");
+        assert!(matches!(
+            &events[2],
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stream_with_no_final_response_still_terminates_with_done() {
+        // rig only populates `response` when the provider yields
+        // `FinalResponse`. Without one there is nothing to bill, and the
+        // stream must still terminate rather than hang or drop its Done.
+        use rig_core::streaming::RawStreamingChoice;
+        let rig_stream = rig_stream_of::<()>(vec![Ok(RawStreamingChoice::Message("hi".into()))]);
+
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string())).await;
+
+        assert_eq!(events.len(), 2, "one text chunk then Done, no Usage");
+        assert!(matches!(&events[0], Ok(StreamEvent::TextChunk(t)) if t == "hi"));
+        assert!(matches!(
+            &events[1],
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::Stop
+            })
+        ));
+        assert!(
+            position_of(&events, |e| matches!(e, StreamEvent::Usage(_))).is_none(),
+            "no usage was reported, so nothing may be billed"
+        );
     }
 
     #[test]
