@@ -199,6 +199,13 @@ pub enum StreamEvent {
     ToolCallArgs { id: String, args_delta: String },
     /// Tool call complete with parsed arguments.
     ToolCallEnd { id: String, args: serde_json::Value },
+    /// Token usage for the completed stream. Emitted immediately before
+    /// [`StreamEvent::Done`], and ONLY when the provider actually reported
+    /// usage: a provider that reports nothing emits no `Usage` event at all
+    /// rather than one carrying zeros, because rig closes a stream with
+    /// `unwrap_or_default()` and zeros are indistinguishable from a real
+    /// zero-token call.
+    Usage(Usage),
     /// Stream terminated.
     Done { finish_reason: FinishReason },
 }

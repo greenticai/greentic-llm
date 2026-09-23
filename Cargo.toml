@@ -26,6 +26,7 @@ categories = ["api-bindings"]
 
 [dependencies]
 anyhow = "1"
+async-stream = { version = "0.3", optional = true }
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 clap = { version = "4.5", optional = true }
@@ -45,5 +46,5 @@ tokio = { version = "1", features = ["rt", "macros"] }
 default = ["rig"]
 bedrock = ["rig", "dep:rig-bedrock"]
 clap = ["dep:clap"]
-rig = ["dep:rig-core"]
+rig = ["dep:rig-core", "dep:async-stream"]
 test-mock = []

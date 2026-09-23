@@ -137,6 +137,45 @@ impl ProviderKind {
             ProviderKind::Llamafile => "llamafile",
         }
     }
+
+    /// Whether this provider reports token usage at the END of a stream.
+    ///
+    /// Four providers send only `stream: true` and never ask for usage, so
+    /// rig's shared driver closes their stream with `unwrap_or_default()` —
+    /// zeros that cannot be told apart from a real zero-token call. A caller
+    /// that meters must refuse a streamed request for one of these BEFORE any
+    /// token is spent, because the fact is only discoverable at the end.
+    ///
+    /// The match is exhaustive on purpose: a new provider must decide here
+    /// rather than inherit "meterable" from a wildcard arm.
+    pub fn reports_streaming_usage(&self) -> bool {
+        match self {
+            ProviderKind::Perplexity
+            | ProviderKind::Mira
+            | ProviderKind::Llamafile
+            | ProviderKind::Openrouter => false,
+            ProviderKind::Openai
+            | ProviderKind::Anthropic
+            | ProviderKind::Deepseek
+            | ProviderKind::Gemini
+            | ProviderKind::Cohere
+            | ProviderKind::Ollama
+            | ProviderKind::Groq
+            | ProviderKind::Xai
+            | ProviderKind::Azure
+            | ProviderKind::AzureFoundry
+            | ProviderKind::Bedrock
+            | ProviderKind::Mistral
+            | ProviderKind::Huggingface
+            | ProviderKind::Together
+            | ProviderKind::Moonshot
+            | ProviderKind::Minimax
+            | ProviderKind::Hyperbolic
+            | ProviderKind::Galadriel
+            | ProviderKind::Zai
+            | ProviderKind::Xiaomimimo => true,
+        }
+    }
 }
 
 impl FromStr for ProviderKind {
@@ -460,5 +499,49 @@ mod tests {
     #[test]
     fn unknown_provider_string_is_rejected() {
         assert!("definitely-not-a-provider".parse::<ProviderKind>().is_err());
+    }
+
+    #[test]
+    fn providers_that_do_not_request_stream_usage_say_so() {
+        // These four send only `stream: true` and never ask for usage, so rig
+        // closes their stream with zeros. Metering must be refused up front for
+        // them rather than billing a zero nobody can audit.
+        for kind in [
+            ProviderKind::Perplexity,
+            ProviderKind::Mira,
+            ProviderKind::Llamafile,
+            ProviderKind::Openrouter,
+        ] {
+            assert!(
+                !kind.reports_streaming_usage(),
+                "{} must report that it cannot meter a stream",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn the_common_providers_do_report_stream_usage() {
+        for kind in [
+            ProviderKind::Openai,
+            ProviderKind::Anthropic,
+            ProviderKind::Gemini,
+            ProviderKind::Ollama,
+        ] {
+            assert!(
+                kind.reports_streaming_usage(),
+                "{} reports usage on stream",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn every_provider_kind_answers_reports_streaming_usage() {
+        // No wildcard arm in the implementation: a new ProviderKind must force a
+        // decision here rather than silently defaulting to "meterable".
+        for kind in ProviderKind::all() {
+            let _ = kind.reports_streaming_usage();
+        }
     }
 }
