@@ -8,8 +8,10 @@
 //! executes exactly one completion per call — the **caller** drives the tool
 //! loop: dispatch the returned `ChatResponse::tool_calls`, append the
 //! assistant turn via `ChatMessage::assistant_with_tool_calls` plus one
-//! `ChatMessage::tool_result` per call, and invoke `chat()` again. Streaming
-//! is not yet implemented and returns `UnsupportedCapability("streaming")`.
+//! `ChatMessage::tool_result` per call, and invoke `chat()` again.
+//! `chat_stream()` drives rig's `CompletionModel::stream` over the same
+//! converted request, adapting rig's chunks into `StreamEvent`s and closing
+//! with `Usage` (only when the provider reported it) then `Done`.
 //!
 //! Architectural note — tools are dynamic
 //! ---------------------------------------
@@ -57,7 +59,8 @@ use rig_core::completion::CompletionModel;
 use super::capabilities::{Capabilities, ProviderKind};
 use super::credentials::Credential;
 use super::provider::{
-    ChatRequest, ChatResponse, ChatStream, FinishReason, LlmError, LlmProvider, MessageRole, Usage,
+    ChatRequest, ChatResponse, ChatStream, FinishReason, LlmError, LlmProvider, MessageRole,
+    StreamEvent, Usage,
 };
 
 /// Backend that dispatches `LlmProvider` calls to rig provider clients.
@@ -622,6 +625,92 @@ fn map_choice(
     }
 }
 
+/// Map rig's end-of-stream usage onto a [`StreamEvent::Usage`], or `None` when
+/// the provider did not report it.
+///
+/// rig's shared openai-compatible driver ends with `unwrap_or_default()`, so a
+/// non-reporting provider yields zeros rather than an absence. This applies the
+/// same `output_tokens == 0` convention [`map_choice`] uses for truncation, so
+/// the crate has ONE rule for "the provider said nothing", not two.
+fn stream_usage_event(reported: rig_core::completion::Usage, model: &str) -> Option<StreamEvent> {
+    if reported.output_tokens == 0 {
+        return None;
+    }
+    Some(StreamEvent::Usage(Usage {
+        model: model.to_string(),
+        input_tokens: reported.input_tokens,
+        output_tokens: reported.output_tokens,
+    }))
+}
+
+/// Adapt a rig streaming response into our [`ChatStream`].
+///
+/// The terminator order is a contract: `Usage` (when the provider reported it)
+/// is emitted BEFORE `Done`, so a consumer that stops reading at `Done` has
+/// already seen the usage.
+///
+/// A tool call arrives from rig complete — `StreamedAssistantContent::ToolCall`
+/// is only yielded once rig has assembled the whole call — so one call becomes
+/// a `ToolCallStart` immediately followed by a `ToolCallEnd`, and no
+/// `StreamEvent::ToolCallArgs` is ever emitted. The correlation id follows
+/// [`map_choice`]: `call_id` when the provider supplied one, else `id`.
+///
+/// The trailing match arm covers rig content this crate deliberately does not
+/// surface — `Final` (its usage is read from `rig_stream.response` below),
+/// `ToolCallDelta` (superseded by the assembled `ToolCall`), `Reasoning` and
+/// `ReasoningDelta` (`map_choice` drops reasoning on the non-streaming path
+/// too). It is a wildcard rather than an exhaustive list on purpose: rig's
+/// enum is not `#[non_exhaustive]` and this crate takes `rig-core = "0.38"`,
+/// so an exhaustive match would turn any new upstream variant into a build
+/// break for every consumer. The no-wildcard rule applies to our own `Inner`
+/// enum, where a missed arm loses a whole provider silently.
+fn map_rig_stream<R>(
+    mut rig_stream: rig_core::streaming::StreamingCompletionResponse<R>,
+    model: String,
+) -> ChatStream
+where
+    R: Clone + Unpin + rig_core::completion::GetTokenUsage + Send + 'static,
+{
+    // `token_usage()` resolves through the `GetTokenUsage` bound on `R`; no
+    // `use` of the trait is needed (and one would be an unused import).
+    use futures_util::StreamExt;
+    use rig_core::streaming::StreamedAssistantContent;
+
+    Box::pin(async_stream::stream! {
+        let mut finish_reason = FinishReason::Stop;
+        while let Some(item) = rig_stream.next().await {
+            match item {
+                Ok(StreamedAssistantContent::Text(t)) => {
+                    yield Ok(StreamEvent::TextChunk(t.text));
+                }
+                Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
+                    let id = tool_call.call_id.unwrap_or(tool_call.id);
+                    yield Ok(StreamEvent::ToolCallStart {
+                        id: id.clone(),
+                        name: tool_call.function.name,
+                    });
+                    yield Ok(StreamEvent::ToolCallEnd {
+                        id,
+                        args: tool_call.function.arguments,
+                    });
+                    finish_reason = FinishReason::ToolCalls;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    yield Err(map_completion_error(e));
+                    return;
+                }
+            }
+        }
+        if let Some(reported) = rig_stream.response.as_ref().and_then(|r| r.token_usage())
+            && let Some(event) = stream_usage_event(reported, &model)
+        {
+            yield Ok(event);
+        }
+        yield Ok(StreamEvent::Done { finish_reason });
+    })
+}
+
 /// Map rig's `CompletionError` onto [`LlmError`], preserving HTTP status
 /// codes where rig surfaces them.
 fn map_completion_error(e: rig_core::completion::CompletionError) -> LlmError {
@@ -741,11 +830,69 @@ impl LlmProvider for RigBackend {
         }
     }
 
-    /// Streaming is not yet implemented by this backend.
-    /// Returns `LlmError::UnsupportedCapability("streaming")` unconditionally.
-    /// The canonical capability string checked by callers is `"streaming"`.
-    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream, LlmError> {
-        Err(LlmError::UnsupportedCapability("streaming"))
+    /// Stream a single completion from the configured provider.
+    ///
+    /// Same capability gate as [`LlmProvider::chat`]: requests carrying tools
+    /// or images are rejected up front when the provider's matrix does not
+    /// advertise the feature. The returned stream terminates with
+    /// [`StreamEvent::Usage`] (only when the provider reported usage) followed
+    /// by [`StreamEvent::Done`]; a provider error mid-stream is yielded as a
+    /// single `Err` item and ends the stream, so no `Done` follows it.
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, LlmError> {
+        let caps = self.capabilities();
+        if !req.tools.is_empty() && !caps.tools {
+            return Err(LlmError::UnsupportedCapability("tools"));
+        }
+        if req.messages.iter().any(|m| !m.images.is_empty()) && !caps.vision {
+            return Err(LlmError::UnsupportedCapability("vision"));
+        }
+
+        let request = build_completion_request(req, self.kind)?;
+        let model = self.model.clone();
+
+        // Mirrors `complete!` in `chat`: each provider's `completion_model()`
+        // returns a different `CompletionModel` type, so the dispatch expands
+        // one identical block per provider. NO wildcard arm: a new `Inner`
+        // variant must fail to compile here rather than silently lose
+        // streaming.
+        macro_rules! stream_with {
+            ($client:expr) => {{
+                let rig_model = $client.completion_model(self.model.as_str());
+                let rig_stream = rig_model
+                    .stream(request)
+                    .await
+                    .map_err(map_completion_error)?;
+                Ok(map_rig_stream(rig_stream, model))
+            }};
+        }
+
+        match &self.inner {
+            Inner::Openai(client) => stream_with!(client),
+            Inner::Anthropic(client) => stream_with!(client),
+            Inner::Deepseek(client) => stream_with!(client),
+            Inner::Gemini(client) => stream_with!(client),
+            Inner::Cohere(client) => stream_with!(client),
+            Inner::Ollama(client) => stream_with!(client),
+            Inner::Groq(client) => stream_with!(client),
+            Inner::Perplexity(client) => stream_with!(client),
+            Inner::Xai(client) => stream_with!(client),
+            Inner::Azure(client) => stream_with!(client),
+            Inner::AzureFoundry(client) => stream_with!(client),
+            Inner::Mistral(client) => stream_with!(client),
+            Inner::Openrouter(client) => stream_with!(client),
+            Inner::Huggingface(client) => stream_with!(client),
+            Inner::Together(client) => stream_with!(client),
+            Inner::Moonshot(client) => stream_with!(client),
+            Inner::Minimax(client) => stream_with!(client),
+            Inner::Hyperbolic(client) => stream_with!(client),
+            Inner::Galadriel(client) => stream_with!(client),
+            Inner::Mira(client) => stream_with!(client),
+            Inner::Zai(client) => stream_with!(client),
+            Inner::Xiaomimimo(client) => stream_with!(client),
+            Inner::Llamafile(client) => stream_with!(client),
+            #[cfg(feature = "bedrock")]
+            Inner::Bedrock(client) => stream_with!(client),
+        }
     }
 }
 
@@ -917,6 +1064,31 @@ mod tests {
         usage.output_tokens = 10;
         let resp = map_choice(choice, usage, Some(4096), "test-model");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn a_zero_usage_reading_produces_no_usage_event() {
+        // rig's contract: output_tokens == 0 means the provider did not report
+        // usage. `map_choice` already refuses to infer truncation from it; the
+        // stream path must refuse to bill from it for the same reason.
+        let reported = rig_core::completion::Usage::new();
+        assert!(stream_usage_event(reported, "test-model").is_none());
+    }
+
+    #[test]
+    fn a_real_usage_reading_produces_a_usage_event() {
+        let mut reported = rig_core::completion::Usage::new();
+        reported.input_tokens = 12;
+        reported.output_tokens = 5;
+        let event = stream_usage_event(reported, "test-model").expect("usage reported");
+        match event {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.model, "test-model");
+                assert_eq!(u.input_tokens, 12);
+                assert_eq!(u.output_tokens, 5);
+            }
+            other => panic!("expected a Usage event, got {other:?}"),
+        }
     }
 
     #[test]
