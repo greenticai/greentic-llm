@@ -562,6 +562,30 @@ fn map_tool_choice(choice: Option<&str>) -> Option<rig_core::message::ToolChoice
     }
 }
 
+/// The ONE rule for a finish reason, shared by `chat()` and `chat_stream()`
+/// so the two cannot disagree about the same turn.
+///
+/// rig carries no finish reason, so a tool call wins, and otherwise truncation
+/// is inferred from usage: `output_tokens` reaching the requested `max_tokens`
+/// cap means the answer was cut off ([`FinishReason::Length`]). With no cap
+/// requested, or no usage reported (`output_tokens == 0`), it never reports
+/// `Length`.
+fn infer_finish_reason(
+    has_tool_calls: bool,
+    output_tokens: u64,
+    requested_max_tokens: Option<u64>,
+) -> FinishReason {
+    let truncated =
+        output_tokens > 0 && requested_max_tokens.is_some_and(|cap| output_tokens >= cap);
+    if has_tool_calls {
+        FinishReason::ToolCalls
+    } else if truncated {
+        FinishReason::Length
+    } else {
+        FinishReason::Stop
+    }
+}
+
 /// Map rig's response choice back onto greentic's [`ChatResponse`].
 ///
 /// Text parts are concatenated (newline-joined); tool calls surface the
@@ -604,15 +628,11 @@ fn map_choice(
             AssistantContent::Reasoning(_) | AssistantContent::Image(_) => {}
         }
     }
-    let truncated = usage.output_tokens > 0
-        && requested_max_tokens.is_some_and(|cap| usage.output_tokens >= cap);
-    let finish_reason = if !tool_calls.is_empty() {
-        FinishReason::ToolCalls
-    } else if truncated {
-        FinishReason::Length
-    } else {
-        FinishReason::Stop
-    };
+    let finish_reason = infer_finish_reason(
+        !tool_calls.is_empty(),
+        usage.output_tokens,
+        requested_max_tokens,
+    );
     let token_usage = Usage {
         model: model.to_string(),
         input_tokens: usage.input_tokens,
@@ -683,11 +703,16 @@ fn stream_usage_event(reported: rig_core::completion::Usage, model: &str) -> Opt
 /// `StreamEvent::ToolCallArgs` is ever emitted. The correlation id follows
 /// [`map_choice`]: `call_id` when the provider supplied one, else `id`.
 ///
+/// Reasoning ([`StreamEvent::Reasoning`]) and tool-argument deltas
+/// ([`StreamEvent::ToolCallArgs`]) are surfaced so a caller can show progress
+/// during the long silent phase of a reasoning model; neither enters the
+/// assembled answer. The finish reason follows [`infer_finish_reason`], the
+/// same rule `chat()` uses, so a stream cut off at the requested cap ends with
+/// [`FinishReason::Length`].
+///
 /// The trailing match arm covers rig content this crate deliberately does not
-/// surface — `Final` (its usage is read from `rig_stream.response` below),
-/// `ToolCallDelta` (superseded by the assembled `ToolCall`), `Reasoning` and
-/// `ReasoningDelta` (`map_choice` drops reasoning on the non-streaming path
-/// too). It is a wildcard rather than an exhaustive list on purpose: rig's
+/// surface — `Final` (its usage is read from `rig_stream.response` below) and
+/// `ToolCallDelta` carrying only a name. It is a wildcard rather than an exhaustive list on purpose: rig's
 /// enum is not `#[non_exhaustive]` and this crate takes `rig-core = "0.38"`,
 /// so an exhaustive match would turn any new upstream variant into a build
 /// break for every consumer. The no-wildcard rule applies to our own `Inner`
@@ -695,6 +720,7 @@ fn stream_usage_event(reported: rig_core::completion::Usage, model: &str) -> Opt
 fn map_rig_stream<R>(
     mut rig_stream: rig_core::streaming::StreamingCompletionResponse<R>,
     model: String,
+    requested_max_tokens: Option<u64>,
 ) -> ChatStream
 where
     R: Clone + Unpin + rig_core::completion::GetTokenUsage + Send + 'static,
@@ -705,7 +731,7 @@ where
     use rig_core::streaming::StreamedAssistantContent;
 
     Box::pin(async_stream::stream! {
-        let mut finish_reason = FinishReason::Stop;
+        let mut saw_tool_call = false;
         while let Some(item) = rig_stream.next().await {
             match item {
                 Ok(StreamedAssistantContent::Text(t)) => {
@@ -721,7 +747,25 @@ where
                         id,
                         args: tool_call.function.arguments,
                     });
-                    finish_reason = FinishReason::ToolCalls;
+                    saw_tool_call = true;
+                }
+                Ok(StreamedAssistantContent::ToolCallDelta {
+                    id,
+                    content: rig_core::streaming::ToolCallDeltaContent::Delta(args_delta),
+                    ..
+                }) => {
+                    yield Ok(StreamEvent::ToolCallArgs { id, args_delta });
+                }
+                Ok(StreamedAssistantContent::ReasoningDelta { reasoning, .. }) => {
+                    if !reasoning.is_empty() {
+                        yield Ok(StreamEvent::Reasoning(reasoning));
+                    }
+                }
+                Ok(StreamedAssistantContent::Reasoning(block)) => {
+                    let text = block.display_text();
+                    if !text.is_empty() {
+                        yield Ok(StreamEvent::Reasoning(text));
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -730,11 +774,14 @@ where
                 }
             }
         }
-        if let Some(reported) = rig_stream.response.as_ref().and_then(|r| r.token_usage())
+        let reported = rig_stream.response.as_ref().and_then(|r| r.token_usage());
+        let output_tokens = reported.map_or(0, |u| u.output_tokens);
+        if let Some(reported) = reported
             && let Some(event) = stream_usage_event(reported, &model)
         {
             yield Ok(event);
         }
+        let finish_reason = infer_finish_reason(saw_tool_call, output_tokens, requested_max_tokens);
         yield Ok(StreamEvent::Done { finish_reason });
     })
 }
@@ -878,6 +925,8 @@ impl LlmProvider for RigBackend {
 
         let request = build_completion_request(req, self.kind)?;
         let model = self.model.clone();
+        // Same capture as `chat`: needed afterwards to infer truncation.
+        let requested_max_tokens = request.max_tokens;
 
         // Mirrors `complete!` in `chat`: each provider's `completion_model()`
         // returns a different `CompletionModel` type, so the dispatch expands
@@ -891,7 +940,7 @@ impl LlmProvider for RigBackend {
                     .stream(request)
                     .await
                     .map_err(map_completion_error)?;
-                Ok(map_rig_stream(rig_stream, model))
+                Ok(map_rig_stream(rig_stream, model, requested_max_tokens))
             }};
         }
 
@@ -1203,6 +1252,107 @@ mod tests {
         events.iter().position(|e| matches!(e, Ok(ev) if pred(ev)))
     }
 
+    fn usage_of(input: u64, output: u64) -> ReportsUsage {
+        let mut u = rig_core::completion::Usage::new();
+        u.input_tokens = input;
+        u.output_tokens = output;
+        ReportsUsage(u)
+    }
+
+    fn done_reason(events: &[Result<StreamEvent, LlmError>]) -> FinishReason {
+        match events.last() {
+            Some(Ok(StreamEvent::Done { finish_reason })) => finish_reason.clone(),
+            other => panic!("expected the stream to end with Done, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_cut_off_at_the_requested_cap_ends_with_length() {
+        // Parity with `chat()`: output_tokens reaching the requested cap with
+        // no tool call is a truncated answer. Without this a streamed round
+        // read as a normal `Stop` and the caller took half an answer for all
+        // of it.
+        use rig_core::streaming::RawStreamingChoice;
+        let rig_stream = rig_stream_of(vec![
+            Ok(RawStreamingChoice::Message("half an ans".into())),
+            Ok(RawStreamingChoice::FinalResponse(usage_of(10, 100))),
+        ]);
+        let events = drain(map_rig_stream(rig_stream, "m".to_string(), Some(100))).await;
+        assert_eq!(done_reason(&events), FinishReason::Length);
+    }
+
+    #[tokio::test]
+    async fn no_requested_cap_or_no_usage_never_reports_length() {
+        use rig_core::streaming::RawStreamingChoice;
+        let uncapped = rig_stream_of(vec![
+            Ok(RawStreamingChoice::Message("x".into())),
+            Ok(RawStreamingChoice::FinalResponse(usage_of(10, 100))),
+        ]);
+        let events = drain(map_rig_stream(uncapped, "m".to_string(), None)).await;
+        assert_eq!(done_reason(&events), FinishReason::Stop);
+
+        let silent = rig_stream_of::<()>(vec![Ok(RawStreamingChoice::Message("x".into()))]);
+        let events = drain(map_rig_stream(silent, "m".to_string(), Some(100))).await;
+        assert_eq!(done_reason(&events), FinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_wins_over_the_cap() {
+        use rig_core::streaming::RawStreamingChoice;
+        let rig_stream = rig_stream_of(vec![
+            Ok(RawStreamingChoice::ToolCall(raw_tool_call(
+                "c1",
+                None,
+                "add_node",
+                serde_json::json!({}),
+            ))),
+            Ok(RawStreamingChoice::FinalResponse(usage_of(10, 100))),
+        ]);
+        let events = drain(map_rig_stream(rig_stream, "m".to_string(), Some(100))).await;
+        assert_eq!(done_reason(&events), FinishReason::ToolCalls);
+    }
+
+    #[tokio::test]
+    async fn reasoning_and_tool_argument_deltas_are_surfaced_in_order() {
+        use rig_core::streaming::{RawStreamingChoice, ToolCallDeltaContent};
+        let rig_stream = rig_stream_of::<()>(vec![
+            Ok(RawStreamingChoice::ReasoningDelta {
+                id: None,
+                reasoning: "let me think".into(),
+            }),
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: "c1".into(),
+                internal_call_id: "i1".into(),
+                content: ToolCallDeltaContent::Name("add_node".into()),
+            }),
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: "c1".into(),
+                internal_call_id: "i1".into(),
+                content: ToolCallDeltaContent::Delta("{\"id\":".into()),
+            }),
+            Ok(RawStreamingChoice::Message("hi".into())),
+        ]);
+        let events = drain(map_rig_stream(rig_stream, "m".to_string(), None)).await;
+        let reasoning_at = position_of(
+            &events,
+            |e| matches!(e, StreamEvent::Reasoning(t) if t == "let me think"),
+        )
+        .expect("a reasoning delta must be surfaced");
+        let args_at = position_of(&events, |e| matches!(e, StreamEvent::ToolCallArgs { args_delta, .. } if args_delta == "{\"id\":"))
+            .expect("an argument delta must be surfaced");
+        let text_at = position_of(&events, |e| matches!(e, StreamEvent::TextChunk(_)))
+            .expect("answer text is still surfaced");
+        assert!(reasoning_at < args_at && args_at < text_at);
+        // A bare name delta carries no arguments and is not an event.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Ok(StreamEvent::ToolCallArgs { .. })))
+                .count(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn a_stream_ends_with_usage_then_done_in_that_order() {
         // The load-bearing ordering assertion. An SSE handler returns at
@@ -1219,7 +1369,7 @@ mod tests {
             Ok(RawStreamingChoice::FinalResponse(ReportsUsage(reported))),
         ]);
 
-        let events = drain(map_rig_stream(rig_stream, "test-model".to_string())).await;
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string(), None)).await;
 
         let text: Vec<String> = events
             .iter()
@@ -1274,7 +1424,7 @@ mod tests {
             Ok(RawStreamingChoice::Message("never read".into())),
         ]);
 
-        let events = drain(map_rig_stream(rig_stream, "test-model".to_string())).await;
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string(), None)).await;
 
         assert_eq!(events.len(), 2, "text chunk then the error, nothing else");
         assert!(matches!(&events[0], Ok(StreamEvent::TextChunk(t)) if t == "partial"));
@@ -1298,7 +1448,7 @@ mod tests {
                 serde_json::json!({"q": "x"}),
             )))]);
 
-        let events = drain(map_rig_stream(rig_stream, "test-model".to_string())).await;
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string(), None)).await;
 
         match &events[0] {
             Ok(StreamEvent::ToolCallStart { id, name }) => {
@@ -1316,7 +1466,7 @@ mod tests {
             raw_tool_call("call_1", None, "lookup", serde_json::json!({"q": "x"})),
         ))]);
 
-        let events = drain(map_rig_stream(rig_stream, "test-model".to_string())).await;
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string(), None)).await;
 
         assert_eq!(events.len(), 3, "start, end, done");
         let start_id = match &events[0] {
@@ -1354,7 +1504,7 @@ mod tests {
         use rig_core::streaming::RawStreamingChoice;
         let rig_stream = rig_stream_of::<()>(vec![Ok(RawStreamingChoice::Message("hi".into()))]);
 
-        let events = drain(map_rig_stream(rig_stream, "test-model".to_string())).await;
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string(), None)).await;
 
         assert_eq!(events.len(), 2, "one text chunk then Done, no Usage");
         assert!(matches!(&events[0], Ok(StreamEvent::TextChunk(t)) if t == "hi"));
