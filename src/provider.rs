@@ -196,7 +196,20 @@ pub enum StreamEvent {
     /// Start marker for a tool call (id + name known, args incoming).
     ToolCallStart { id: String, name: String },
     /// Partial tool-call argument delta (provider-specific JSON fragment).
+    ///
+    /// `id` is the provider's own tool-call id as rig reports it on a delta,
+    /// which is NOT guaranteed to equal the `id` of the closing
+    /// [`StreamEvent::ToolCallEnd`] (that one prefers `call_id`). Use it to
+    /// measure progress, not to correlate; the assembled call arrives whole in
+    /// `ToolCallEnd`.
     ToolCallArgs { id: String, args_delta: String },
+    /// Partial or complete model reasoning ("thinking") text.
+    ///
+    /// It is NOT part of the answer and is never carried into a
+    /// [`ChatResponse`]; it exists so a caller can show that a reasoning model
+    /// is working during the minutes before its first answer token. Treat it
+    /// as private model output: count it, do not display or store it.
+    Reasoning(String),
     /// Tool call complete with parsed arguments.
     ToolCallEnd { id: String, args: serde_json::Value },
     /// Token usage for the completed stream. Emitted immediately before
