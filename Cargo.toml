@@ -12,7 +12,7 @@ name = "greentic-llm"
 # sits at the SAME M.m.p as the lane builds (greentic-mcp-client `1.2.0-research`
 # does; this crate's `1.2.6-research` does not, so the plain range never picked
 # it and there was nothing here to fix).
-version = "1.2.0-dev.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
