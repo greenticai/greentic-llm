@@ -8,8 +8,11 @@
 //! executes exactly one completion per call — the **caller** drives the tool
 //! loop: dispatch the returned `ChatResponse::tool_calls`, append the
 //! assistant turn via `ChatMessage::assistant_with_tool_calls` plus one
-//! `ChatMessage::tool_result` per call, and invoke `chat()` again. Streaming
-//! is not yet implemented and returns `UnsupportedCapability("streaming")`.
+//! `ChatMessage::tool_result` per call, and invoke `chat()` again.
+//! `chat_stream()` drives rig's `CompletionModel::stream` over the same
+//! converted request, adapting rig's chunks into `StreamEvent`s and closing
+//! with `Usage` — emitted unless the provider's whole token reading is zero,
+//! which is rig's signal that it supplied no usage at all — then `Done`.
 //!
 //! Architectural note — tools are dynamic
 //! ---------------------------------------
@@ -57,7 +60,8 @@ use rig_core::completion::CompletionModel;
 use super::capabilities::{Capabilities, ProviderKind};
 use super::credentials::Credential;
 use super::provider::{
-    ChatRequest, ChatResponse, ChatStream, FinishReason, LlmError, LlmProvider, MessageRole, Usage,
+    ChatRequest, ChatResponse, ChatStream, FinishReason, LlmError, LlmProvider, MessageRole,
+    StreamEvent, Usage,
 };
 
 /// Backend that dispatches `LlmProvider` calls to rig provider clients.
@@ -386,6 +390,10 @@ fn build_completion_request(
         AssistantContent, ImageMediaType, Message, MimeType, ToolResultContent, UserContent,
     };
 
+    // Resolve tool_choice first: a choice the provider cannot express fails
+    // here, before any message conversion or network call.
+    let (tools, tool_choice) = resolve_tool_choice(kind, req.tools, req.tool_choice.as_deref())?;
+
     // Build the preamble while the messages are still borrowable; the loop
     // below consumes them.
     let preamble = build_preamble(&req.messages);
@@ -460,8 +468,7 @@ fn build_completion_request(
         preamble,
         chat_history,
         documents: vec![],
-        tools: req
-            .tools
+        tools: tools
             .into_iter()
             .map(|t| rig_core::completion::ToolDefinition {
                 name: t.name,
@@ -471,10 +478,74 @@ fn build_completion_request(
             .collect(),
         temperature: req.temperature.map(f64::from),
         max_tokens,
-        tool_choice: map_tool_choice(req.tool_choice.as_deref()),
+        tool_choice,
         additional_params: None,
         output_schema: None,
     })
+}
+
+/// Resolve the caller's `tool_choice` against what the provider's wire
+/// protocol can express. Returns the tools to advertise and the rig
+/// `ToolChoice` to forward.
+///
+/// Every provider except Ollama forwards the choice unchanged through
+/// [`map_tool_choice`] and rig's provider-specific encoding.
+///
+/// Ollama has no `tool_choice` on the wire, so the forward path would drop it:
+///
+/// - rig 0.38.2's `ollama::OllamaCompletionRequest` has no such field. Its
+///   `TryFrom` logs `` `tool_choice` not supported for Ollama `` and discards
+///   the value (`providers/ollama.rs:447`). Any other `additional_params` key
+///   is merged into `options`, not the top level, so it can't be smuggled
+///   through there either.
+/// - Ollama's own `api.ChatRequest` (native `/api/chat`, which rig targets)
+///   and `openai.ChatCompletionRequest` (its `/v1` compatibility shim) have
+///   no `tool_choice` field either. Checked at ollama `4f6f739`. Go's JSON
+///   decoder drops unknown keys, so sending the field would not fail; it
+///   would just be ignored.
+///
+/// Ollama always behaves like `auto`: when `tools` is present the model may
+/// call one or answer in text. Given that, Ollama handles each choice as
+/// follows:
+///
+/// | `tool_choice`      | Ollama behaviour                                  |
+/// |--------------------|---------------------------------------------------|
+/// | absent / `"auto"`  | tools sent unchanged. Ollama's only mode, so this matches exactly. |
+/// | `"none"`           | tools are **not sent**, so the model cannot call one. |
+/// | `"required"`       | refused: `UnsupportedCapability`                  |
+/// | a function name    | refused: `UnsupportedCapability`                  |
+///
+/// The last two are refused rather than degraded. A caller asking to force a
+/// call expects its next step to receive one; quietly sending a plain `auto`
+/// request would let the model answer in text and break that step
+/// downstream, far from the cause. To steer Ollama toward one function, send
+/// only that function in `tools`.
+///
+/// For `"auto"` rig receives `None` rather than `ToolChoice::Auto`, so it no
+/// longer logs a "not supported" warning for a choice that is honoured.
+#[allow(clippy::type_complexity)]
+fn resolve_tool_choice(
+    kind: ProviderKind,
+    tools: Vec<super::provider::ToolDef>,
+    choice: Option<&str>,
+) -> Result<
+    (
+        Vec<super::provider::ToolDef>,
+        Option<rig_core::message::ToolChoice>,
+    ),
+    LlmError,
+> {
+    if kind != ProviderKind::Ollama {
+        return Ok((tools, map_tool_choice(choice)));
+    }
+    match choice {
+        None | Some("auto") => Ok((tools, None)),
+        Some("none") => Ok((Vec::new(), None)),
+        Some("required") => Err(LlmError::UnsupportedCapability("tool_choice=required")),
+        Some(_) => Err(LlmError::UnsupportedCapability(
+            "tool_choice=<named function>",
+        )),
+    }
 }
 
 /// Map the greentic `tool_choice` string convention (`"auto"` / `"none"` /
@@ -488,6 +559,30 @@ fn map_tool_choice(choice: Option<&str>) -> Option<rig_core::message::ToolChoice
         Some(name) => Some(rig_core::message::ToolChoice::Specific {
             function_names: vec![name.to_string()],
         }),
+    }
+}
+
+/// The ONE rule for a finish reason, shared by `chat()` and `chat_stream()`
+/// so the two cannot disagree about the same turn.
+///
+/// rig carries no finish reason, so a tool call wins, and otherwise truncation
+/// is inferred from usage: `output_tokens` reaching the requested `max_tokens`
+/// cap means the answer was cut off ([`FinishReason::Length`]). With no cap
+/// requested, or no usage reported (`output_tokens == 0`), it never reports
+/// `Length`.
+fn infer_finish_reason(
+    has_tool_calls: bool,
+    output_tokens: u64,
+    requested_max_tokens: Option<u64>,
+) -> FinishReason {
+    let truncated =
+        output_tokens > 0 && requested_max_tokens.is_some_and(|cap| output_tokens >= cap);
+    if has_tool_calls {
+        FinishReason::ToolCalls
+    } else if truncated {
+        FinishReason::Length
+    } else {
+        FinishReason::Stop
     }
 }
 
@@ -533,15 +628,11 @@ fn map_choice(
             AssistantContent::Reasoning(_) | AssistantContent::Image(_) => {}
         }
     }
-    let truncated = usage.output_tokens > 0
-        && requested_max_tokens.is_some_and(|cap| usage.output_tokens >= cap);
-    let finish_reason = if !tool_calls.is_empty() {
-        FinishReason::ToolCalls
-    } else if truncated {
-        FinishReason::Length
-    } else {
-        FinishReason::Stop
-    };
+    let finish_reason = infer_finish_reason(
+        !tool_calls.is_empty(),
+        usage.output_tokens,
+        requested_max_tokens,
+    );
     let token_usage = Usage {
         model: model.to_string(),
         input_tokens: usage.input_tokens,
@@ -553,6 +644,146 @@ fn map_choice(
         finish_reason,
         usage: Some(token_usage),
     }
+}
+
+/// Map rig's end-of-stream usage onto a [`StreamEvent::Usage`], or `None` when
+/// the whole reading is zero.
+///
+/// rig's shared openai-compatible driver ends with `unwrap_or_default()`, so a
+/// non-reporting provider yields a zeroed `Usage` rather than an absence. rig's
+/// own contract names the WHOLE reading, not the output counter: "If tokens
+/// used are `0`, then the provider failed to supply token usage metrics"
+/// (`rig_core::completion::Usage`). So the test here is `input_tokens == 0 &&
+/// output_tokens == 0`.
+///
+/// **A zero `output_tokens` beside a non-zero `input_tokens` is a real
+/// reading and is billed.** `unwrap_or_default()` cannot produce it: a non-zero
+/// input count proves the provider sent a usage block. It is the normal shape
+/// of a turn that consumed a prompt and emitted nothing — a Gemini candidate
+/// blocked by a safety filter (`promptTokenCount` with no
+/// `candidatesTokenCount`), an immediate stop sequence, a refusal. The provider
+/// charges for those input tokens, so suppressing the event would lose the
+/// charge silently.
+///
+/// The reading is deliberately NOT compared against `Usage::default()`: that
+/// would admit a `total_tokens`-only reading and emit a meter event carrying
+/// `{0, 0}`, which is worse than emitting nothing — an absence can be noticed,
+/// a zeroed charge cannot.
+///
+/// This is the same interpretation of zeros [`map_choice`] applies when it
+/// declines to infer [`FinishReason::Length`], but the two paths ACT on it
+/// differently and a meter author needs to know which one they are reading:
+/// `map_choice` fills `ChatResponse::usage` unconditionally, zeros included, so
+/// a non-reporting provider yields `Some(Usage { input_tokens: 0,
+/// output_tokens: 0, .. })` from `chat()` and NO `StreamEvent::Usage` at all
+/// from `chat_stream()`. One rule for interpreting zeros, two behaviours for
+/// acting on them. Reconciling them would change `chat()` for every existing
+/// caller, so it is recorded here rather than done in passing.
+fn stream_usage_event(reported: rig_core::completion::Usage, model: &str) -> Option<StreamEvent> {
+    if reported.input_tokens == 0 && reported.output_tokens == 0 {
+        return None;
+    }
+    Some(StreamEvent::Usage(Usage {
+        model: model.to_string(),
+        input_tokens: reported.input_tokens,
+        output_tokens: reported.output_tokens,
+    }))
+}
+
+/// Adapt a rig streaming response into our [`ChatStream`].
+///
+/// The terminator order is a contract: `Usage` — emitted unless the provider's
+/// whole token reading is zero, see [`stream_usage_event`] — comes BEFORE
+/// `Done`, so a consumer that stops reading at `Done` has already seen the
+/// usage.
+///
+/// A tool call arrives from rig complete — `StreamedAssistantContent::ToolCall`
+/// is only yielded once rig has assembled the whole call — so one call becomes
+/// a `ToolCallStart` immediately followed by a `ToolCallEnd`, and no
+/// `StreamEvent::ToolCallArgs` is ever emitted. The correlation id follows
+/// [`map_choice`]: `call_id` when the provider supplied one, else `id`.
+///
+/// Reasoning ([`StreamEvent::Reasoning`]) and tool-argument deltas
+/// ([`StreamEvent::ToolCallArgs`]) are surfaced so a caller can show progress
+/// during the long silent phase of a reasoning model; neither enters the
+/// assembled answer. The finish reason follows [`infer_finish_reason`], the
+/// same rule `chat()` uses, so a stream cut off at the requested cap ends with
+/// [`FinishReason::Length`].
+///
+/// The trailing match arm covers rig content this crate deliberately does not
+/// surface — `Final` (its usage is read from `rig_stream.response` below) and
+/// `ToolCallDelta` carrying only a name. It is a wildcard rather than an exhaustive list on purpose: rig's
+/// enum is not `#[non_exhaustive]` and this crate takes `rig-core = "0.38"`,
+/// so an exhaustive match would turn any new upstream variant into a build
+/// break for every consumer. The no-wildcard rule applies to our own `Inner`
+/// enum, where a missed arm loses a whole provider silently.
+fn map_rig_stream<R>(
+    mut rig_stream: rig_core::streaming::StreamingCompletionResponse<R>,
+    model: String,
+    requested_max_tokens: Option<u64>,
+) -> ChatStream
+where
+    R: Clone + Unpin + rig_core::completion::GetTokenUsage + Send + 'static,
+{
+    // `token_usage()` resolves through the `GetTokenUsage` bound on `R`; no
+    // `use` of the trait is needed (and one would be an unused import).
+    use futures_util::StreamExt;
+    use rig_core::streaming::StreamedAssistantContent;
+
+    Box::pin(async_stream::stream! {
+        let mut saw_tool_call = false;
+        while let Some(item) = rig_stream.next().await {
+            match item {
+                Ok(StreamedAssistantContent::Text(t)) => {
+                    yield Ok(StreamEvent::TextChunk(t.text));
+                }
+                Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
+                    let id = tool_call.call_id.unwrap_or(tool_call.id);
+                    yield Ok(StreamEvent::ToolCallStart {
+                        id: id.clone(),
+                        name: tool_call.function.name,
+                    });
+                    yield Ok(StreamEvent::ToolCallEnd {
+                        id,
+                        args: tool_call.function.arguments,
+                    });
+                    saw_tool_call = true;
+                }
+                Ok(StreamedAssistantContent::ToolCallDelta {
+                    id,
+                    content: rig_core::streaming::ToolCallDeltaContent::Delta(args_delta),
+                    ..
+                }) => {
+                    yield Ok(StreamEvent::ToolCallArgs { id, args_delta });
+                }
+                Ok(StreamedAssistantContent::ReasoningDelta { reasoning, .. }) => {
+                    if !reasoning.is_empty() {
+                        yield Ok(StreamEvent::Reasoning(reasoning));
+                    }
+                }
+                Ok(StreamedAssistantContent::Reasoning(block)) => {
+                    let text = block.display_text();
+                    if !text.is_empty() {
+                        yield Ok(StreamEvent::Reasoning(text));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    yield Err(map_completion_error(e));
+                    return;
+                }
+            }
+        }
+        let reported = rig_stream.response.as_ref().and_then(|r| r.token_usage());
+        let output_tokens = reported.map_or(0, |u| u.output_tokens);
+        if let Some(reported) = reported
+            && let Some(event) = stream_usage_event(reported, &model)
+        {
+            yield Ok(event);
+        }
+        let finish_reason = infer_finish_reason(saw_tool_call, output_tokens, requested_max_tokens);
+        yield Ok(StreamEvent::Done { finish_reason });
+    })
 }
 
 /// Map rig's `CompletionError` onto [`LlmError`], preserving HTTP status
@@ -674,11 +905,72 @@ impl LlmProvider for RigBackend {
         }
     }
 
-    /// Streaming is not yet implemented by this backend.
-    /// Returns `LlmError::UnsupportedCapability("streaming")` unconditionally.
-    /// The canonical capability string checked by callers is `"streaming"`.
-    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream, LlmError> {
-        Err(LlmError::UnsupportedCapability("streaming"))
+    /// Stream a single completion from the configured provider.
+    ///
+    /// Same capability gate as [`LlmProvider::chat`]: requests carrying tools
+    /// or images are rejected up front when the provider's matrix does not
+    /// advertise the feature. The returned stream terminates with
+    /// [`StreamEvent::Usage`] — emitted unless the provider's whole token
+    /// reading is zero, see [`stream_usage_event`] — followed by
+    /// [`StreamEvent::Done`]; a provider error mid-stream is yielded as a
+    /// single `Err` item and ends the stream, so no `Done` follows it.
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, LlmError> {
+        let caps = self.capabilities();
+        if !req.tools.is_empty() && !caps.tools {
+            return Err(LlmError::UnsupportedCapability("tools"));
+        }
+        if req.messages.iter().any(|m| !m.images.is_empty()) && !caps.vision {
+            return Err(LlmError::UnsupportedCapability("vision"));
+        }
+
+        let request = build_completion_request(req, self.kind)?;
+        let model = self.model.clone();
+        // Same capture as `chat`: needed afterwards to infer truncation.
+        let requested_max_tokens = request.max_tokens;
+
+        // Mirrors `complete!` in `chat`: each provider's `completion_model()`
+        // returns a different `CompletionModel` type, so the dispatch expands
+        // one identical block per provider. NO wildcard arm: a new `Inner`
+        // variant must fail to compile here rather than silently lose
+        // streaming.
+        macro_rules! stream_with {
+            ($client:expr) => {{
+                let rig_model = $client.completion_model(self.model.as_str());
+                let rig_stream = rig_model
+                    .stream(request)
+                    .await
+                    .map_err(map_completion_error)?;
+                Ok(map_rig_stream(rig_stream, model, requested_max_tokens))
+            }};
+        }
+
+        match &self.inner {
+            Inner::Openai(client) => stream_with!(client),
+            Inner::Anthropic(client) => stream_with!(client),
+            Inner::Deepseek(client) => stream_with!(client),
+            Inner::Gemini(client) => stream_with!(client),
+            Inner::Cohere(client) => stream_with!(client),
+            Inner::Ollama(client) => stream_with!(client),
+            Inner::Groq(client) => stream_with!(client),
+            Inner::Perplexity(client) => stream_with!(client),
+            Inner::Xai(client) => stream_with!(client),
+            Inner::Azure(client) => stream_with!(client),
+            Inner::AzureFoundry(client) => stream_with!(client),
+            Inner::Mistral(client) => stream_with!(client),
+            Inner::Openrouter(client) => stream_with!(client),
+            Inner::Huggingface(client) => stream_with!(client),
+            Inner::Together(client) => stream_with!(client),
+            Inner::Moonshot(client) => stream_with!(client),
+            Inner::Minimax(client) => stream_with!(client),
+            Inner::Hyperbolic(client) => stream_with!(client),
+            Inner::Galadriel(client) => stream_with!(client),
+            Inner::Mira(client) => stream_with!(client),
+            Inner::Zai(client) => stream_with!(client),
+            Inner::Xiaomimimo(client) => stream_with!(client),
+            Inner::Llamafile(client) => stream_with!(client),
+            #[cfg(feature = "bedrock")]
+            Inner::Bedrock(client) => stream_with!(client),
+        }
     }
 }
 
@@ -853,6 +1145,382 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_usage_reading_produces_no_usage_event() {
+        // rig's contract: output_tokens == 0 means the provider did not report
+        // usage. `map_choice` already refuses to infer truncation from it; the
+        // stream path must refuse to bill from it for the same reason.
+        let reported = rig_core::completion::Usage::new();
+        assert!(stream_usage_event(reported, "test-model").is_none());
+    }
+
+    #[test]
+    fn a_real_usage_reading_produces_a_usage_event() {
+        let mut reported = rig_core::completion::Usage::new();
+        reported.input_tokens = 12;
+        reported.output_tokens = 5;
+        let event = stream_usage_event(reported, "test-model").expect("usage reported");
+        match event {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.model, "test-model");
+                assert_eq!(u.input_tokens, 12);
+                assert_eq!(u.output_tokens, 5);
+            }
+            other => panic!("expected a Usage event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_prompt_only_usage_reading_is_still_billed() {
+        // `unwrap_or_default()` cannot produce a non-zero input count, so this
+        // IS a provider reading: a prompt was consumed and nothing was emitted
+        // (safety-filtered candidate, immediate stop sequence, refusal). The
+        // provider charges for those input tokens.
+        let mut reported = rig_core::completion::Usage::new();
+        reported.input_tokens = 12;
+        reported.output_tokens = 0;
+        let event = stream_usage_event(reported, "test-model").expect("usage reported");
+        match event {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.model, "test-model");
+                assert_eq!(u.input_tokens, 12);
+                assert_eq!(u.output_tokens, 0);
+            }
+            other => panic!("expected a Usage event, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // `map_rig_stream` — driven offline against rig's own public stream
+    // constructor. `StreamingCompletionResponse::stream` takes a
+    // `StreamingResult<R>`, and `RawStreamingChoice` / `RawStreamingToolCall`
+    // are public with public fields, so a provider stream can be faked
+    // exactly as rig's own drivers emit one — no network, no credential.
+    // ------------------------------------------------------------------
+
+    /// A final-response payload that reports usage. rig ships
+    /// `impl GetTokenUsage for ()` (a stream that reports nothing) but no impl
+    /// for `Usage` itself, so the reporting case needs a local carrier.
+    #[derive(Clone)]
+    struct ReportsUsage(rig_core::completion::Usage);
+
+    impl rig_core::completion::GetTokenUsage for ReportsUsage {
+        fn token_usage(&self) -> Option<rig_core::completion::Usage> {
+            Some(self.0)
+        }
+    }
+
+    fn rig_stream_of<R>(
+        items: Vec<
+            Result<
+                rig_core::streaming::RawStreamingChoice<R>,
+                rig_core::completion::CompletionError,
+            >,
+        >,
+    ) -> rig_core::streaming::StreamingCompletionResponse<R>
+    where
+        R: Clone + Unpin + rig_core::completion::GetTokenUsage + Send + 'static,
+    {
+        rig_core::streaming::StreamingCompletionResponse::stream(Box::pin(
+            futures_util::stream::iter(items),
+        ))
+    }
+
+    async fn drain(stream: ChatStream) -> Vec<Result<StreamEvent, LlmError>> {
+        use futures_util::StreamExt;
+        stream.collect().await
+    }
+
+    fn raw_tool_call(
+        id: &str,
+        call_id: Option<&str>,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> rig_core::streaming::RawStreamingToolCall {
+        let mut tc = rig_core::streaming::RawStreamingToolCall::empty();
+        tc.id = id.to_string();
+        tc.call_id = call_id.map(str::to_string);
+        tc.name = name.to_string();
+        tc.arguments = arguments;
+        tc
+    }
+
+    /// Position of the first event matching `pred`, or `None`.
+    fn position_of(
+        events: &[Result<StreamEvent, LlmError>],
+        pred: impl Fn(&StreamEvent) -> bool,
+    ) -> Option<usize> {
+        events.iter().position(|e| matches!(e, Ok(ev) if pred(ev)))
+    }
+
+    fn usage_of(input: u64, output: u64) -> ReportsUsage {
+        let mut u = rig_core::completion::Usage::new();
+        u.input_tokens = input;
+        u.output_tokens = output;
+        ReportsUsage(u)
+    }
+
+    fn done_reason(events: &[Result<StreamEvent, LlmError>]) -> FinishReason {
+        match events.last() {
+            Some(Ok(StreamEvent::Done { finish_reason })) => finish_reason.clone(),
+            other => panic!("expected the stream to end with Done, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_cut_off_at_the_requested_cap_ends_with_length() {
+        // Parity with `chat()`: output_tokens reaching the requested cap with
+        // no tool call is a truncated answer. Without this a streamed round
+        // read as a normal `Stop` and the caller took half an answer for all
+        // of it.
+        use rig_core::streaming::RawStreamingChoice;
+        let rig_stream = rig_stream_of(vec![
+            Ok(RawStreamingChoice::Message("half an ans".into())),
+            Ok(RawStreamingChoice::FinalResponse(usage_of(10, 100))),
+        ]);
+        let events = drain(map_rig_stream(rig_stream, "m".to_string(), Some(100))).await;
+        assert_eq!(done_reason(&events), FinishReason::Length);
+    }
+
+    #[tokio::test]
+    async fn no_requested_cap_or_no_usage_never_reports_length() {
+        use rig_core::streaming::RawStreamingChoice;
+        let uncapped = rig_stream_of(vec![
+            Ok(RawStreamingChoice::Message("x".into())),
+            Ok(RawStreamingChoice::FinalResponse(usage_of(10, 100))),
+        ]);
+        let events = drain(map_rig_stream(uncapped, "m".to_string(), None)).await;
+        assert_eq!(done_reason(&events), FinishReason::Stop);
+
+        let silent = rig_stream_of::<()>(vec![Ok(RawStreamingChoice::Message("x".into()))]);
+        let events = drain(map_rig_stream(silent, "m".to_string(), Some(100))).await;
+        assert_eq!(done_reason(&events), FinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_wins_over_the_cap() {
+        use rig_core::streaming::RawStreamingChoice;
+        let rig_stream = rig_stream_of(vec![
+            Ok(RawStreamingChoice::ToolCall(raw_tool_call(
+                "c1",
+                None,
+                "add_node",
+                serde_json::json!({}),
+            ))),
+            Ok(RawStreamingChoice::FinalResponse(usage_of(10, 100))),
+        ]);
+        let events = drain(map_rig_stream(rig_stream, "m".to_string(), Some(100))).await;
+        assert_eq!(done_reason(&events), FinishReason::ToolCalls);
+    }
+
+    #[tokio::test]
+    async fn reasoning_and_tool_argument_deltas_are_surfaced_in_order() {
+        use rig_core::streaming::{RawStreamingChoice, ToolCallDeltaContent};
+        let rig_stream = rig_stream_of::<()>(vec![
+            Ok(RawStreamingChoice::ReasoningDelta {
+                id: None,
+                reasoning: "let me think".into(),
+            }),
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: "c1".into(),
+                internal_call_id: "i1".into(),
+                content: ToolCallDeltaContent::Name("add_node".into()),
+            }),
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: "c1".into(),
+                internal_call_id: "i1".into(),
+                content: ToolCallDeltaContent::Delta("{\"id\":".into()),
+            }),
+            Ok(RawStreamingChoice::Message("hi".into())),
+        ]);
+        let events = drain(map_rig_stream(rig_stream, "m".to_string(), None)).await;
+        let reasoning_at = position_of(
+            &events,
+            |e| matches!(e, StreamEvent::Reasoning(t) if t == "let me think"),
+        )
+        .expect("a reasoning delta must be surfaced");
+        let args_at = position_of(&events, |e| matches!(e, StreamEvent::ToolCallArgs { args_delta, .. } if args_delta == "{\"id\":"))
+            .expect("an argument delta must be surfaced");
+        let text_at = position_of(&events, |e| matches!(e, StreamEvent::TextChunk(_)))
+            .expect("answer text is still surfaced");
+        assert!(reasoning_at < args_at && args_at < text_at);
+        // A bare name delta carries no arguments and is not an event.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Ok(StreamEvent::ToolCallArgs { .. })))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_ends_with_usage_then_done_in_that_order() {
+        // The load-bearing ordering assertion. An SSE handler returns at
+        // `Done`, so a `Usage` emitted after it is never read and the call is
+        // never billed — silently. Asserting "contains a Usage" would pass in
+        // that broken world; asserting the POSITIONS is what catches it.
+        use rig_core::streaming::RawStreamingChoice;
+        let mut reported = rig_core::completion::Usage::new();
+        reported.input_tokens = 12;
+        reported.output_tokens = 5;
+        let rig_stream = rig_stream_of(vec![
+            Ok(RawStreamingChoice::Message("Hel".into())),
+            Ok(RawStreamingChoice::Message("lo".into())),
+            Ok(RawStreamingChoice::FinalResponse(ReportsUsage(reported))),
+        ]);
+
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string(), None)).await;
+
+        let text: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::TextChunk(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, vec!["Hel".to_string(), "lo".to_string()]);
+
+        let usage_at = position_of(&events, |e| matches!(e, StreamEvent::Usage(_)))
+            .expect("a reported usage must produce a Usage event");
+        let done_at = position_of(&events, |e| matches!(e, StreamEvent::Done { .. }))
+            .expect("a clean stream must terminate with Done");
+        assert!(
+            usage_at < done_at,
+            "Usage must precede Done: usage at {usage_at}, done at {done_at}"
+        );
+        assert_eq!(
+            done_at,
+            events.len() - 1,
+            "Done must be the last event; nothing may follow it"
+        );
+
+        match &events[usage_at] {
+            Ok(StreamEvent::Usage(u)) => {
+                assert_eq!(u.model, "test-model");
+                assert_eq!(u.input_tokens, 12);
+                assert_eq!(u.output_tokens, 5);
+            }
+            other => panic!("expected a Usage event, got {other:?}"),
+        }
+        assert!(matches!(
+            &events[done_at],
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::Stop
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_yields_one_err_and_no_done() {
+        use rig_core::streaming::RawStreamingChoice;
+        // Not the word "aborted": rig's own `poll_next` treats a
+        // ProviderError containing it as ordinary cancellation and swallows
+        // it, so such a stream would never reach our error arm at all.
+        let rig_stream = rig_stream_of::<()>(vec![
+            Ok(RawStreamingChoice::Message("partial".into())),
+            Err(rig_core::completion::CompletionError::ProviderError(
+                "boom".into(),
+            )),
+            Ok(RawStreamingChoice::Message("never read".into())),
+        ]);
+
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string(), None)).await;
+
+        assert_eq!(events.len(), 2, "text chunk then the error, nothing else");
+        assert!(matches!(&events[0], Ok(StreamEvent::TextChunk(t)) if t == "partial"));
+        assert!(matches!(&events[1], Err(LlmError::Transport(m)) if m == "boom"));
+        assert!(
+            position_of(&events, |e| matches!(e, StreamEvent::Done { .. })).is_none(),
+            "an errored stream must not also claim a clean Done"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_call_prefers_call_id_over_id() {
+        // Twin of `maps_choice_prefers_call_id_when_present`: the id a caller
+        // echoes back must not depend on whether the turn was streamed.
+        use rig_core::streaming::RawStreamingChoice;
+        let rig_stream =
+            rig_stream_of::<()>(vec![Ok(RawStreamingChoice::ToolCall(raw_tool_call(
+                "id_raw",
+                Some("call_9"),
+                "lookup",
+                serde_json::json!({"q": "x"}),
+            )))]);
+
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string(), None)).await;
+
+        match &events[0] {
+            Ok(StreamEvent::ToolCallStart { id, name }) => {
+                assert_eq!(id, "call_9");
+                assert_eq!(name, "lookup");
+            }
+            other => panic!("expected ToolCallStart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_call_bookends_one_id_and_sets_the_finish_reason() {
+        use rig_core::streaming::RawStreamingChoice;
+        let rig_stream = rig_stream_of::<()>(vec![Ok(RawStreamingChoice::ToolCall(
+            raw_tool_call("call_1", None, "lookup", serde_json::json!({"q": "x"})),
+        ))]);
+
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string(), None)).await;
+
+        assert_eq!(events.len(), 3, "start, end, done");
+        let start_id = match &events[0] {
+            Ok(StreamEvent::ToolCallStart { id, name }) => {
+                assert_eq!(name, "lookup");
+                id.clone()
+            }
+            other => panic!("expected ToolCallStart, got {other:?}"),
+        };
+        match &events[1] {
+            Ok(StreamEvent::ToolCallEnd { id, args }) => {
+                assert_eq!(
+                    id, &start_id,
+                    "start and end must name the same call, or the caller \
+                     cannot correlate the result"
+                );
+                assert_eq!(args, &serde_json::json!({"q": "x"}));
+            }
+            other => panic!("expected ToolCallEnd, got {other:?}"),
+        }
+        assert_eq!(start_id, "call_1", "no call_id, so the provider id is used");
+        assert!(matches!(
+            &events[2],
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stream_with_no_final_response_still_terminates_with_done() {
+        // rig only populates `response` when the provider yields
+        // `FinalResponse`. Without one there is nothing to bill, and the
+        // stream must still terminate rather than hang or drop its Done.
+        use rig_core::streaming::RawStreamingChoice;
+        let rig_stream = rig_stream_of::<()>(vec![Ok(RawStreamingChoice::Message("hi".into()))]);
+
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string(), None)).await;
+
+        assert_eq!(events.len(), 2, "one text chunk then Done, no Usage");
+        assert!(matches!(&events[0], Ok(StreamEvent::TextChunk(t)) if t == "hi"));
+        assert!(matches!(
+            &events[1],
+            Ok(StreamEvent::Done {
+                finish_reason: FinishReason::Stop
+            })
+        ));
+        assert!(
+            position_of(&events, |e| matches!(e, StreamEvent::Usage(_))).is_none(),
+            "no usage was reported, so nothing may be billed"
+        );
+    }
+
+    #[test]
     fn user_message_with_image_becomes_image_content() {
         let mut msg = ChatMessage::user("look at this");
         msg.images.push(ChatImage {
@@ -1007,8 +1675,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_tools_when_capability_says_no() {
-        // Ollama advertises tools = false.
-        let b = RigBackend::new(ProviderKind::Ollama, "llama3.2", &dummy_cred()).expect("build");
+        // Llamafile advertises tools = false. This was Ollama until Ollama's
+        // declaration was corrected — the subject changed, the mechanism being
+        // pinned did not: a request carrying tools must be refused HERE, on
+        // the matrix, before any provider call is built.
+        let b =
+            RigBackend::new(ProviderKind::Llamafile, "any-model", &dummy_cred()).expect("build");
         let req = ChatRequest {
             messages: vec![ChatMessage::user("hi")],
             tools: vec![ToolDef {
@@ -1022,6 +1694,55 @@ mod tests {
         };
         let err = b.chat(req).await.expect_err("must reject");
         assert!(matches!(err, LlmError::UnsupportedCapability("tools")));
+    }
+
+    /// End-to-end proof that lifting Ollama's `tools` flag exposes real tool
+    /// calling rather than a differently-shaped failure — the flag alone only
+    /// proves the guard stopped firing.
+    ///
+    /// `#[ignore]`d: it needs a local Ollama serving a tool-capable model. Run
+    /// it with a daemon on 11434 and llama3.2 pulled:
+    ///
+    /// ```text
+    /// cargo test --lib rig_backend::tests::ollama_really_calls_a_tool -- --ignored --nocapture
+    /// ```
+    ///
+    /// Note the base URL carries no `/v1`: this backend appends its own path,
+    /// and a doubled prefix 404s.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "needs a local Ollama daemon with a tool-capable model"]
+    async fn ollama_really_calls_a_tool() {
+        let cred = Credential {
+            api_key: String::new(),
+            base_url: Some("http://127.0.0.1:11434".to_string()),
+            expires_at: None,
+            api_version: None,
+            aws_profile: None,
+        };
+        let b = RigBackend::new(ProviderKind::Ollama, "llama3.2:latest", &cred).expect("build");
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user(
+                "What is the weather in Jakarta? Use the tool.",
+            )],
+            tools: vec![ToolDef {
+                name: "get_weather".into(),
+                description: "Get the current weather for a city".into(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"]
+                }),
+            }],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+        };
+        let res = b.chat(req).await.expect("ollama answers");
+        assert_eq!(res.finish_reason, FinishReason::ToolCalls, "{res:?}");
+        assert_eq!(
+            res.tool_calls.first().map(|c| c.name.as_str()),
+            Some("get_weather")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1042,6 +1763,203 @@ mod tests {
         };
         let err = b.chat(req).await.expect_err("must reject");
         assert!(matches!(err, LlmError::UnsupportedCapability("vision")));
+    }
+
+    fn tool_request_with_choice(choice: Option<&str>) -> ChatRequest {
+        let mut req = tool_request();
+        req.tool_choice = choice.map(str::to_string);
+        req
+    }
+
+    #[test]
+    fn ollama_auto_or_absent_keeps_tools_and_forwards_no_choice() {
+        for choice in [None, Some("auto")] {
+            let r =
+                build_completion_request(tool_request_with_choice(choice), ProviderKind::Ollama)
+                    .expect("convert");
+            assert_eq!(r.tools.len(), 1, "{choice:?}: tools must be advertised");
+            // `None`, not `ToolChoice::Auto`: rig would log a false
+            // "not supported" warning for a choice that is honoured.
+            assert!(r.tool_choice.is_none(), "{choice:?}");
+        }
+    }
+
+    #[test]
+    fn ollama_none_withholds_the_tools() {
+        let r =
+            build_completion_request(tool_request_with_choice(Some("none")), ProviderKind::Ollama)
+                .expect("convert");
+        assert!(r.tools.is_empty(), "a model with no tools cannot call one");
+        assert!(r.tool_choice.is_none());
+        // History, tool calls and tool results included, is untouched.
+        assert_eq!(r.chat_history.len(), 3);
+    }
+
+    #[test]
+    fn ollama_refuses_choices_it_cannot_express() {
+        let cases = [
+            ("required", "tool_choice=required"),
+            ("lookup", "tool_choice=<named function>"),
+        ];
+        for (choice, capability) in cases {
+            let err = build_completion_request(
+                tool_request_with_choice(Some(choice)),
+                ProviderKind::Ollama,
+            )
+            .expect_err("must refuse rather than send an un-forced request");
+            match err {
+                LlmError::UnsupportedCapability(c) => assert_eq!(c, capability, "{choice}"),
+                other => panic!("{choice}: unexpected error {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn non_ollama_providers_forward_tool_choice_unchanged() {
+        // The Ollama handling must not leak into providers whose protocol
+        // encodes the field.
+        for kind in [ProviderKind::Openai, ProviderKind::Llamafile] {
+            let r = build_completion_request(tool_request_with_choice(Some("none")), kind)
+                .expect("convert");
+            assert_eq!(r.tools.len(), 1, "{kind:?}");
+            assert!(matches!(
+                r.tool_choice,
+                Some(rig_core::message::ToolChoice::None)
+            ));
+            let r = build_completion_request(tool_request_with_choice(Some("required")), kind)
+                .expect("convert");
+            assert!(matches!(
+                r.tool_choice,
+                Some(rig_core::message::ToolChoice::Required)
+            ));
+        }
+    }
+
+    /// Serve exactly one HTTP request on a loopback port with a canned Ollama
+    /// `/api/chat` reply, and hand back the request path and JSON body.
+    ///
+    /// These assertions are about the body rig puts on the wire. The
+    /// `CompletionRequest` is only an intermediate form, and rig's Ollama
+    /// encoding is where the field used to disappear.
+    fn one_shot_ollama() -> (String, std::thread::JoinHandle<(String, serde_json::Value)>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut chunk).expect("read");
+                assert!(n > 0, "connection closed before headers completed");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let content_length = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .expect("request carries a Content-Length");
+            while buf.len() < header_end + content_length {
+                let n = stream.read(&mut chunk).expect("read body");
+                assert!(n > 0, "connection closed before body completed");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let path = head
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_string();
+            let body: serde_json::Value =
+                serde_json::from_slice(&buf[header_end..header_end + content_length])
+                    .expect("request body is JSON");
+
+            let reply = serde_json::json!({
+                "model": "m",
+                "created_at": "2026-09-18T00:00:00Z",
+                "message": { "role": "assistant", "content": "ok" },
+                "done": true,
+                "done_reason": "stop"
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            stream.write_all(response.as_bytes()).expect("write reply");
+            (path, body)
+        });
+        (base, handle)
+    }
+
+    async fn ollama_wire_body(choice: Option<&str>) -> (String, serde_json::Value) {
+        let (base, server) = one_shot_ollama();
+        let cred = Credential {
+            api_key: String::new(),
+            base_url: Some(base),
+            expires_at: None,
+            api_version: None,
+            aws_profile: None,
+        };
+        let b = RigBackend::new(ProviderKind::Ollama, "m", &cred).expect("build");
+        let res = b
+            .chat(tool_request_with_choice(choice))
+            .await
+            .expect("chat against the loopback server");
+        assert_eq!(res.content, "ok");
+        server.join().expect("server thread")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ollama_wire_auto_sends_tools_and_no_tool_choice_key() {
+        let (path, body) = ollama_wire_body(Some("auto")).await;
+        assert_eq!(path, "/api/chat", "rig targets Ollama's native endpoint");
+        let tools = body["tools"].as_array().expect("tools on the wire");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "lookup");
+        // Ollama has no such field; its absence is the correct encoding.
+        assert!(body.get("tool_choice").is_none(), "{body}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ollama_wire_none_sends_no_tools() {
+        let (path, body) = ollama_wire_body(Some("none")).await;
+        assert_eq!(path, "/api/chat");
+        assert!(
+            body.get("tools").is_none(),
+            "tools must be withheld: {body}"
+        );
+        assert!(body.get("tool_choice").is_none(), "{body}");
+        // The conversation, earlier tool turns included, still goes out.
+        assert!(
+            body["messages"].as_array().is_some_and(|m| m.len() >= 3),
+            "{body}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ollama_required_fails_before_any_request_is_sent() {
+        // `dummy_cred()` leaves the default localhost:11434. Whether or not a
+        // daemon listens there, reaching the transport would yield a
+        // Transport/Status error or a response, never this refusal.
+        let b = RigBackend::new(ProviderKind::Ollama, "m", &dummy_cred()).expect("build");
+        let err = b
+            .chat(tool_request_with_choice(Some("required")))
+            .await
+            .expect_err("must refuse");
+        assert!(matches!(
+            err,
+            LlmError::UnsupportedCapability("tool_choice=required")
+        ));
     }
 
     #[test]

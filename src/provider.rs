@@ -136,6 +136,12 @@ pub struct ChatRequest {
     pub tools: Vec<ToolDef>,
     /// Optional tool selection hint. Conventionally `"auto"`, `"required"`,
     /// `"none"`, or a specific tool name; provider-specific semantics apply.
+    ///
+    /// Ollama's API has no `tool_choice` field. The rig backend honours
+    /// `"auto"` (Ollama's only mode) and `"none"` (tools are not sent), and
+    /// returns [`LlmError::UnsupportedCapability`] for `"required"` or a named
+    /// function instead of silently sending an un-forced request. See
+    /// `rig_backend::resolve_tool_choice`.
     pub tool_choice: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
@@ -190,9 +196,29 @@ pub enum StreamEvent {
     /// Start marker for a tool call (id + name known, args incoming).
     ToolCallStart { id: String, name: String },
     /// Partial tool-call argument delta (provider-specific JSON fragment).
+    ///
+    /// `id` is the provider's own tool-call id as rig reports it on a delta,
+    /// which is NOT guaranteed to equal the `id` of the closing
+    /// [`StreamEvent::ToolCallEnd`] (that one prefers `call_id`). Use it to
+    /// measure progress, not to correlate; the assembled call arrives whole in
+    /// `ToolCallEnd`.
     ToolCallArgs { id: String, args_delta: String },
+    /// Partial or complete model reasoning ("thinking") text.
+    ///
+    /// It is NOT part of the answer and is never carried into a
+    /// [`ChatResponse`]; it exists so a caller can show that a reasoning model
+    /// is working during the minutes before its first answer token. Treat it
+    /// as private model output: count it, do not display or store it.
+    Reasoning(String),
     /// Tool call complete with parsed arguments.
     ToolCallEnd { id: String, args: serde_json::Value },
+    /// Token usage for the completed stream. Emitted immediately before
+    /// [`StreamEvent::Done`], and ONLY when the provider actually reported
+    /// usage: a provider that reports nothing emits no `Usage` event at all
+    /// rather than one carrying zeros, because rig closes a stream with
+    /// `unwrap_or_default()` and zeros are indistinguishable from a real
+    /// zero-token call.
+    Usage(Usage),
     /// Stream terminated.
     Done { finish_reason: FinishReason },
 }

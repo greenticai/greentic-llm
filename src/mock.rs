@@ -19,7 +19,7 @@ use futures_util::stream::{self, StreamExt};
 
 use super::capabilities::Capabilities;
 use super::provider::{
-    ChatRequest, ChatResponse, ChatStream, FinishReason, LlmError, LlmProvider, StreamEvent,
+    ChatRequest, ChatResponse, ChatStream, FinishReason, LlmError, LlmProvider, StreamEvent, Usage,
 };
 
 /// Test double for the new `LlmProvider` trait. Builder-style construction.
@@ -162,6 +162,11 @@ impl LlmProvider for TestLlmProvider {
         let text = self.response_text.clone();
         let events = vec![
             Ok(StreamEvent::TextChunk(text)),
+            Ok(StreamEvent::Usage(Usage {
+                model: self.model.clone(),
+                input_tokens: 1,
+                output_tokens: 2,
+            })),
             Ok(StreamEvent::Done {
                 finish_reason: FinishReason::Stop,
             }),
@@ -233,5 +238,39 @@ mod tests {
 
         let third = provider.chat(req()).await.unwrap();
         assert_eq!(third.content, "fallback");
+    }
+
+    #[tokio::test]
+    async fn mock_stream_reports_usage_before_it_terminates() {
+        use futures_util::StreamExt;
+        let provider = TestLlmProvider::default();
+        let mut stream = provider
+            .chat_stream(ChatRequest {
+                messages: vec![],
+                tools: vec![],
+                tool_choice: None,
+                max_tokens: None,
+                temperature: None,
+            })
+            .await
+            .expect("mock streams");
+
+        let mut saw_usage = false;
+        let mut saw_done_after_usage = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("no stream error") {
+                StreamEvent::Usage(u) => {
+                    assert_eq!(u.output_tokens, 2);
+                    saw_usage = true;
+                }
+                StreamEvent::Done { .. } => saw_done_after_usage = saw_usage,
+                _ => {}
+            }
+        }
+        assert!(saw_usage, "the mock must emit a Usage event");
+        assert!(
+            saw_done_after_usage,
+            "Usage must arrive BEFORE Done, or a consumer that stops at Done never sees it"
+        );
     }
 }
