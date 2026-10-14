@@ -424,7 +424,17 @@ fn build_completion_request(
                     content.push(AssistantContent::text(m.content));
                 }
                 for tc in m.tool_calls {
-                    content.push(AssistantContent::tool_call(tc.id, tc.name, tc.arguments));
+                    // The id may carry a provider signature (see
+                    // `call_id_with_signature`); split it back so the provider
+                    // receives its own id and its own signature.
+                    let (id, signature) = split_call_id(&tc.id);
+                    content.push(AssistantContent::ToolCall(
+                        rig_core::message::ToolCall::new(
+                            id.to_string(),
+                            rig_core::message::ToolFunction::new(tc.name, tc.arguments),
+                        )
+                        .with_signature(signature.map(str::to_string)),
+                    ));
                 }
                 if content.is_empty() {
                     // Skip empty assistant turns rather than erroring; some
@@ -444,6 +454,7 @@ fn build_completion_request(
                 let id = m
                     .tool_call_id
                     .ok_or_else(|| LlmError::Parse("tool message missing tool_call_id".into()))?;
+                let (id, _) = split_call_id(&id);
                 history.push(Message::User {
                     content: rig_core::OneOrMany::one(UserContent::tool_result(
                         id,
@@ -586,6 +597,38 @@ fn infer_finish_reason(
     }
 }
 
+/// Separates a provider call id from its signature inside
+/// [`ToolCall::id`](super::provider::ToolCall::id) (ASCII unit separator, which
+/// neither a provider id nor a base64 signature contains).
+const SIGNATURE_SEP: char = '\u{1f}';
+
+/// Fold a provider's opaque call signature into the call id.
+///
+/// Gemini 3 answers a tool call with a `thoughtSignature` and refuses the next
+/// request of the loop ("Function call is missing a thought_signature") unless
+/// that signature is sent back on the replayed call. [`ToolCall`](super::provider::ToolCall)
+/// and [`StreamEvent`] have no field for it, and adding one would break every
+/// crate that builds those by literal, but every caller already echoes `id`
+/// verbatim into the assistant turn and the tool result, so the signature rides
+/// there. [`split_call_id`] undoes this before anything reaches the provider.
+/// An id with no signature is returned unchanged, so every other provider is
+/// unaffected.
+fn call_id_with_signature(id: String, signature: Option<String>) -> String {
+    match signature {
+        Some(sig) if !sig.is_empty() => format!("{id}{SIGNATURE_SEP}{sig}"),
+        _ => id,
+    }
+}
+
+/// Inverse of [`call_id_with_signature`]: `(provider id, signature)`.
+fn split_call_id(id: &str) -> (&str, Option<&str>) {
+    match id.split_once(SIGNATURE_SEP) {
+        Some((base, sig)) if !sig.is_empty() => (base, Some(sig)),
+        Some((base, _)) => (base, None),
+        None => (id, None),
+    }
+}
+
 /// Map rig's response choice back onto greentic's [`ChatResponse`].
 ///
 /// Text parts are concatenated (newline-joined); tool calls surface the
@@ -620,7 +663,7 @@ fn map_choice(
                 content.push_str(&t.text);
             }
             AssistantContent::ToolCall(tc) => tool_calls.push(super::provider::ToolCall {
-                id: tc.call_id.unwrap_or(tc.id),
+                id: call_id_with_signature(tc.call_id.unwrap_or(tc.id), tc.signature),
                 name: tc.function.name,
                 arguments: tc.function.arguments,
             }),
@@ -738,7 +781,10 @@ where
                     yield Ok(StreamEvent::TextChunk(t.text));
                 }
                 Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
-                    let id = tool_call.call_id.unwrap_or(tool_call.id);
+                    let id = call_id_with_signature(
+                        tool_call.call_id.unwrap_or(tool_call.id),
+                        tool_call.signature,
+                    );
                     yield Ok(StreamEvent::ToolCallStart {
                         id: id.clone(),
                         name: tool_call.function.name,
@@ -1076,6 +1122,79 @@ mod tests {
         assert_eq!(resp.tool_calls[0].id, "call_9");
         assert_eq!(resp.tool_calls[0].name, "lookup");
         assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[test]
+    fn a_signature_in_the_call_id_is_replayed_on_the_assistant_tool_call() {
+        let signed = "call_1\u{1f}sig_abc";
+        let mut req = tool_request();
+        req.messages[2] = ChatMessage::assistant_with_tool_calls(
+            "",
+            vec![ToolCall {
+                id: signed.into(),
+                name: "lookup".into(),
+                arguments: serde_json::json!({"q": "x"}),
+            }],
+        );
+        req.messages[3] = ChatMessage::tool_result(signed, "{\"answer\":42}");
+        let r = build_completion_request(req, ProviderKind::Gemini).expect("convert");
+        let history: Vec<_> = r.chat_history.into_iter().collect();
+        match &history[1] {
+            rig_core::message::Message::Assistant { content, .. } => match content.first() {
+                rig_core::message::AssistantContent::ToolCall(tc) => {
+                    assert_eq!(tc.id, "call_1", "the provider sees its own id");
+                    assert_eq!(tc.signature.as_deref(), Some("sig_abc"));
+                }
+                other => panic!("expected tool call, got {other:?}"),
+            },
+            other => panic!("expected assistant message, got {other:?}"),
+        }
+        match &history[2] {
+            rig_core::message::Message::User { content } => match content.first() {
+                rig_core::message::UserContent::ToolResult(tr) => assert_eq!(tr.id, "call_1"),
+                other => panic!("expected tool result, got {other:?}"),
+            },
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_choice_carries_the_tool_call_signature_in_the_id() {
+        let tc = rig_core::message::ToolCall::new(
+            "call_9".into(),
+            rig_core::message::ToolFunction::new("lookup".into(), serde_json::json!({})),
+        )
+        .with_signature(Some("sig_abc".into()));
+        let choice = rig_core::OneOrMany::one(rig_core::message::AssistantContent::ToolCall(tc));
+        let resp = map_choice(choice, rig_core::completion::Usage::new(), None, "m");
+        assert_eq!(resp.tool_calls[0].id, "call_9\u{1f}sig_abc");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_call_carries_the_signature_in_both_bookend_ids() {
+        use rig_core::streaming::RawStreamingChoice;
+        let mut raw = raw_tool_call("call_1", None, "lookup", serde_json::json!({"q": "x"}));
+        raw.signature = Some("sig_abc".into());
+        let rig_stream = rig_stream_of::<()>(vec![Ok(RawStreamingChoice::ToolCall(raw))]);
+        let events = drain(map_rig_stream(rig_stream, "test-model".to_string(), None)).await;
+        match (&events[0], &events[1]) {
+            (
+                Ok(StreamEvent::ToolCallStart { id: start, .. }),
+                Ok(StreamEvent::ToolCallEnd { id: end, .. }),
+            ) => {
+                assert_eq!(start, "call_1\u{1f}sig_abc");
+                assert_eq!(start, end, "start and end must still correlate");
+            }
+            other => panic!("expected start/end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_call_id_tolerates_ids_without_a_signature() {
+        assert_eq!(split_call_id("call_1"), ("call_1", None));
+        assert_eq!(split_call_id("call_1\u{1f}"), ("call_1", None));
+        assert_eq!(split_call_id("c\u{1f}s"), ("c", Some("s")));
+        assert_eq!(call_id_with_signature("c".into(), Some(String::new())), "c");
     }
 
     #[test]
